@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FitPlan Pro</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                   "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    #header-bg, #icon-badge, #header-title, .nav-btn {
+      transition: background-color 0.35s ease, color 0.35s ease;
+    }
+    #bottom-nav::-webkit-scrollbar { display: none; }
+    #bottom-nav { -ms-overflow-style: none; scrollbar-width: none; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    /* Modal sheet transition — minden modalhoz */
+    #pr-modal-sheet, #diet-modal-sheet, #wo-modal-sheet,
+    #rec-modal-sheet, #doc-modal-sheet {
+      transition: transform 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+    }
+  </style>
+</head>
+
+<body class="bg-gray-50 min-h-screen">
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  BEJELENTKEZÉSI KÉPERNYŐ                               -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="login-screen"
+       class="fixed inset-0 flex items-center justify-center bg-white z-50">
+    <div class="text-center px-8 max-w-sm w-full">
+
+      <div class="mx-auto w-20 h-20 rounded-3xl bg-emerald-500
+                  flex items-center justify-center shadow-lg mb-6">
+        <i class="fa-solid fa-heart-pulse text-white text-3xl"></i>
+      </div>
+
+      <h1 class="text-3xl font-bold text-gray-900 tracking-tight">FitPlan Pro</h1>
+      <p class="mt-2 text-gray-400 text-sm">Fitnesz &amp; életmód menedzsment</p>
+
+      <button id="btn-google-login"
+              class="mt-10 w-full flex items-center justify-center gap-3
+                     py-3 px-5 rounded-2xl border border-gray-200 bg-white
+                     shadow-sm hover:shadow-md text-gray-700 font-medium text-sm
+                     transition-all duration-200 hover:-translate-y-0.5 active:scale-95">
+        <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+             alt="Google" class="w-5 h-5" />
+        Folytatás Google-fiókkal
+      </button>
+
+      <p class="mt-6 text-xs text-gray-300">
+        A bejelentkezéssel elfogadod az adatvédelmi feltételeket.
+      </p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  FŐ ALKALMAZÁS SHELL                                   -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="app-shell" class="hidden flex flex-col min-h-screen">
+
+    <!-- ── FEJLÉC ─────────────────────────────────────────── -->
+    <header id="header-bg"
+            class="sticky top-0 z-40 px-4 pt-5 pb-4"
+            style="background-color: #dcfce7;">
+      <div class="max-w-2xl mx-auto flex items-center justify-between gap-4">
+
+        <div class="flex items-center gap-3">
+          <div id="icon-badge"
+               class="w-11 h-11 rounded-2xl flex items-center justify-center
+                      shadow-sm flex-shrink-0"
+               style="background-color: #16a34a;">
+            <i id="header-icon"
+               class="fa-solid fa-apple-whole text-white text-xl"></i>
+          </div>
+          <div>
+            <h1 id="header-title"
+                class="text-lg font-bold leading-tight tracking-tight"
+                style="color: #16a34a;">Diéta</h1>
+            <p id="header-sub"
+               class="text-xs text-gray-400 leading-tight">Napi Étkezések</p>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <img id="user-avatar" src="" alt="Avatar"
+               class="w-8 h-8 rounded-full object-cover border border-gray-200" />
+          <button id="btn-logout"
+                  class="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                  title="Kijelentkezés">
+            <i class="fa-solid fa-right-from-bracket"></i>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- ── FŐ TARTALOM ────────────────────────────────────── -->
+    <main class="flex-1 max-w-2xl mx-auto w-full px-4 py-6">
+
+
+      <!-- ════════════════════════ DIÉTA PANEL ═════════════ -->
+      <div id="panel-diet" class="module-panel">
+
+        <div class="grid grid-cols-3 gap-2.5 mb-5">
+          <div class="bg-emerald-50 border border-emerald-100 rounded-2xl p-3 text-center">
+            <p id="diet-stat-calories"
+               class="text-2xl font-bold text-emerald-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-emerald-400 font-medium mt-1">kcal ma</p>
+          </div>
+          <div class="bg-emerald-50 border border-emerald-100 rounded-2xl p-3 text-center">
+            <p id="diet-stat-protein"
+               class="text-2xl font-bold text-emerald-600 tabular-nums leading-tight">0g</p>
+            <p class="text-[11px] text-emerald-400 font-medium mt-1">Protein</p>
+          </div>
+          <div class="bg-emerald-50 border border-emerald-100 rounded-2xl p-3 text-center">
+            <p id="diet-stat-meals"
+               class="text-2xl font-bold text-emerald-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-emerald-400 font-medium mt-1">Étkezés ma</p>
+          </div>
+        </div>
+
+        <div class="flex gap-2 overflow-x-auto pb-1 mb-5 no-scrollbar">
+          <button class="diet-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="all">Összes</button>
+          <button class="diet-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="breakfast">
+            <i class="fa-solid fa-sun mr-1"></i>Reggeli</button>
+          <button class="diet-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="lunch">
+            <i class="fa-solid fa-cloud-sun mr-1"></i>Ebéd</button>
+          <button class="diet-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="dinner">
+            <i class="fa-solid fa-moon mr-1"></i>Vacsora</button>
+          <button class="diet-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="snack">
+            <i class="fa-solid fa-cookie-bite mr-1"></i>Snack</button>
+        </div>
+
+        <div id="diet-records-list" class="space-y-3 pb-28"></div>
+
+        <button id="diet-fab"
+                class="fixed bottom-20 right-5 w-14 h-14 rounded-full
+                       bg-emerald-500 shadow-xl flex items-center justify-center
+                       active:scale-95 hover:bg-emerald-600 transition-all z-30">
+          <i class="fa-solid fa-plus text-white text-xl"></i>
+        </button>
+      </div>
+
+
+      <!-- ════════════════════════ EDZÉS PANEL ═════════════ -->
+      <div id="panel-workout" class="module-panel hidden">
+
+        <div class="grid grid-cols-3 gap-2.5 mb-5">
+          <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 text-center">
+            <p id="wo-stat-week"
+               class="text-2xl font-bold text-indigo-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-indigo-400 font-medium mt-1">E héten</p>
+          </div>
+          <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 text-center">
+            <p id="wo-stat-total"
+               class="text-2xl font-bold text-indigo-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-indigo-400 font-medium mt-1">Összes</p>
+          </div>
+          <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-3 text-center">
+            <p id="wo-stat-streak"
+               class="text-2xl font-bold text-indigo-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-indigo-400 font-medium mt-1">Nap sorozat</p>
+          </div>
+        </div>
+
+        <div id="wo-records-list" class="space-y-3 pb-28"></div>
+
+        <button id="wo-fab"
+                class="fixed bottom-20 right-5 w-14 h-14 rounded-full
+                       bg-indigo-600 shadow-xl flex items-center justify-center
+                       active:scale-95 hover:bg-indigo-700 transition-all z-30">
+          <i class="fa-solid fa-plus text-white text-xl"></i>
+        </button>
+      </div>
+
+
+      <!-- ══════════════════════ REGENERÁCIÓ PANEL ════════ -->
+      <div id="panel-recovery" class="module-panel hidden">
+
+        <div class="grid grid-cols-3 gap-2.5 mb-5">
+          <div class="bg-violet-50 border border-violet-100 rounded-2xl p-3 text-center">
+            <p id="rec-stat-avg"
+               class="text-2xl font-bold text-violet-600 tabular-nums leading-tight">—</p>
+            <p class="text-[11px] text-violet-400 font-medium mt-1">Átlag (óra)</p>
+          </div>
+          <div class="bg-violet-50 border border-violet-100 rounded-2xl p-3 text-center">
+            <p id="rec-stat-best"
+               class="text-2xl font-bold text-violet-600 tabular-nums leading-tight">—</p>
+            <p class="text-[11px] text-violet-400 font-medium mt-1">Legjobb</p>
+          </div>
+          <div class="bg-violet-50 border border-violet-100 rounded-2xl p-3 text-center">
+            <p id="rec-stat-total"
+               class="text-2xl font-bold text-violet-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-violet-400 font-medium mt-1">Naplózva</p>
+          </div>
+        </div>
+
+        <div id="rec-records-list" class="space-y-3 pb-28"></div>
+
+        <button id="rec-fab"
+                class="fixed bottom-20 right-5 w-14 h-14 rounded-full
+                       bg-violet-600 shadow-xl flex items-center justify-center
+                       active:scale-95 hover:bg-violet-700 transition-all z-30">
+          <i class="fa-solid fa-plus text-white text-xl"></i>
+        </button>
+      </div>
+
+
+      <!-- ════════════════════════ REKORDOK PANEL ══════════ -->
+      <div id="panel-prhub" class="module-panel hidden">
+
+        <div class="grid grid-cols-3 gap-2.5 mb-5">
+          <div class="bg-amber-50 border border-amber-100 rounded-2xl p-3 text-center">
+            <p id="pr-stat-total"
+               class="text-2xl font-bold text-amber-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-amber-400 font-medium mt-1">Rekord</p>
+          </div>
+          <div class="bg-amber-50 border border-amber-100 rounded-2xl p-3 text-center">
+            <p id="pr-stat-best1rm"
+               class="text-2xl font-bold text-amber-600 tabular-nums leading-tight">—</p>
+            <p class="text-[11px] text-amber-400 font-medium mt-1">Legjobb 1RM</p>
+          </div>
+          <div class="bg-amber-50 border border-amber-100 rounded-2xl p-3 text-center">
+            <p id="pr-stat-topname"
+               class="text-base font-bold text-amber-600 leading-tight truncate">—</p>
+            <p class="text-[11px] text-amber-400 font-medium mt-1">Top gyakorlat</p>
+          </div>
+        </div>
+
+        <div class="flex gap-2 overflow-x-auto pb-1 mb-5 no-scrollbar">
+          <button class="pr-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="all">Összes</button>
+          <button class="pr-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="strength">
+            <i class="fa-solid fa-dumbbell mr-1"></i>Súlyzós</button>
+          <button class="pr-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="running">
+            <i class="fa-solid fa-person-running mr-1"></i>Futás</button>
+          <button class="pr-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="cycling">
+            <i class="fa-solid fa-bicycle mr-1"></i>Kerékpár</button>
+          <button class="pr-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="swimming">
+            <i class="fa-solid fa-person-swimming mr-1"></i>Úszás</button>
+        </div>
+
+        <div id="pr-records-list" class="space-y-3 pb-28"></div>
+
+        <button id="pr-fab"
+                class="fixed bottom-20 right-5 w-14 h-14 rounded-full
+                       bg-amber-500 shadow-xl flex items-center justify-center
+                       active:scale-95 hover:bg-amber-600 transition-all z-30">
+          <i class="fa-solid fa-plus text-white text-xl"></i>
+        </button>
+      </div>
+
+
+      <!-- ════════════════════════ DOKUMENTUMOK PANEL ══════ -->
+      <div id="panel-documents" class="module-panel hidden">
+
+        <div class="grid grid-cols-3 gap-2.5 mb-5">
+          <div class="bg-cyan-50 border border-cyan-100 rounded-2xl p-3 text-center">
+            <p id="doc-stat-total"
+               class="text-2xl font-bold text-cyan-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-cyan-400 font-medium mt-1">Dokumentum</p>
+          </div>
+          <div class="bg-cyan-50 border border-cyan-100 rounded-2xl p-3 text-center">
+            <p id="doc-stat-leletek"
+               class="text-2xl font-bold text-cyan-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-cyan-400 font-medium mt-1">Lelet</p>
+          </div>
+          <div class="bg-cyan-50 border border-cyan-100 rounded-2xl p-3 text-center">
+            <p id="doc-stat-receptek"
+               class="text-2xl font-bold text-cyan-600 tabular-nums leading-tight">0</p>
+            <p class="text-[11px] text-cyan-400 font-medium mt-1">Recept</p>
+          </div>
+        </div>
+
+        <div class="flex gap-2 overflow-x-auto pb-1 mb-5 no-scrollbar">
+          <button class="doc-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="all">Összes</button>
+          <button class="doc-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="lelet">
+            <i class="fa-solid fa-flask mr-1"></i>Lelet</button>
+          <button class="doc-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="recept">
+            <i class="fa-solid fa-prescription mr-1"></i>Recept</button>
+          <button class="doc-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="vizsgalat">
+            <i class="fa-solid fa-stethoscope mr-1"></i>Vizsgálat</button>
+          <button class="doc-filter-btn flex-shrink-0 px-4 py-1.5 rounded-full
+                         text-xs font-semibold transition-all" data-filter="egyeb">
+            <i class="fa-solid fa-file mr-1"></i>Egyéb</button>
+        </div>
+
+        <div id="doc-records-list" class="space-y-3 pb-28"></div>
+
+        <button id="doc-fab"
+                class="fixed bottom-20 right-5 w-14 h-14 rounded-full
+                       bg-cyan-500 shadow-xl flex items-center justify-center
+                       active:scale-95 hover:bg-cyan-600 transition-all z-30">
+          <i class="fa-solid fa-plus text-white text-xl"></i>
+        </button>
+      </div>
+
+
+    </main>
+
+    <!-- ── ALSÓ NAVIGÁCIÓ ─────────────────────────────────── -->
+    <nav id="bottom-nav"
+         class="sticky bottom-0 z-40 bg-white/90 backdrop-blur-md
+                border-t border-gray-100 flex overflow-x-auto gap-1 px-3 py-2">
+
+      <button class="nav-btn flex-1 min-w-[58px] flex flex-col items-center
+                     gap-1 py-2 px-1 rounded-xl text-gray-400 transition-all duration-200"
+              data-module="diet">
+        <i class="fa-solid fa-apple-whole text-base"></i>
+        <span class="text-[10px] font-medium leading-none">Diéta</span>
+      </button>
+
+      <button class="nav-btn flex-1 min-w-[58px] flex flex-col items-center
+                     gap-1 py-2 px-1 rounded-xl text-gray-400 transition-all duration-200"
+              data-module="workout">
+        <i class="fa-solid fa-dumbbell text-base"></i>
+        <span class="text-[10px] font-medium leading-none">Edzés</span>
+      </button>
+
+      <button class="nav-btn flex-1 min-w-[58px] flex flex-col items-center
+                     gap-1 py-2 px-1 rounded-xl text-gray-400 transition-all duration-200"
+              data-module="recovery">
+        <i class="fa-solid fa-moon text-base"></i>
+        <span class="text-[10px] font-medium leading-none">Regeneráció</span>
+      </button>
+
+      <button class="nav-btn flex-1 min-w-[58px] flex flex-col items-center
+                     gap-1 py-2 px-1 rounded-xl text-gray-400 transition-all duration-200"
+              data-module="prhub">
+        <i class="fa-solid fa-trophy text-base"></i>
+        <span class="text-[10px] font-medium leading-none">Rekordok</span>
+      </button>
+
+      <button class="nav-btn flex-1 min-w-[58px] flex flex-col items-center
+                     gap-1 py-2 px-1 rounded-xl text-gray-400 transition-all duration-200"
+              data-module="documents">
+        <i class="fa-solid fa-file-medical text-base"></i>
+        <span class="text-[10px] font-medium leading-none">Dok.</span>
+      </button>
+
+    </nav>
+  </div><!-- /app-shell -->
+
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  DIÉTA MODÁLIS ABLAK                                   -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="diet-modal" class="fixed inset-0 z-50 hidden">
+    <div id="diet-modal-backdrop"
+         class="absolute inset-0 bg-black/30 backdrop-blur-sm"></div>
+    <div id="diet-modal-sheet"
+         style="transform: translateY(100%)"
+         class="absolute bottom-0 left-0 right-0 max-w-2xl mx-auto
+                bg-white rounded-t-3xl shadow-2xl">
+
+      <div class="flex justify-center pt-3 pb-2">
+        <div class="w-10 h-1 rounded-full bg-gray-200"></div>
+      </div>
+
+      <div class="flex items-center justify-between px-5 pb-4 border-b border-gray-100">
+        <h2 class="text-lg font-bold text-gray-900">Étkezés rögzítése</h2>
+        <button id="diet-modal-close"
+                class="w-8 h-8 rounded-full bg-gray-100 flex items-center
+                       justify-center text-gray-500 hover:bg-gray-200 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <div class="px-5 py-4 overflow-y-auto max-h-[75vh] no-scrollbar">
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-3 block">Étkezés típusa</label>
+          <div class="grid grid-cols-4 gap-2">
+            <button type="button"
+                    class="diet-meal-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-meal="breakfast">
+              <i class="fa-solid fa-sun text-lg"></i>
+              <span class="text-[11px] font-semibold">Reggeli</span>
+            </button>
+            <button type="button"
+                    class="diet-meal-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-meal="lunch">
+              <i class="fa-solid fa-cloud-sun text-lg"></i>
+              <span class="text-[11px] font-semibold">Ebéd</span>
+            </button>
+            <button type="button"
+                    class="diet-meal-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-meal="dinner">
+              <i class="fa-solid fa-moon text-lg"></i>
+              <span class="text-[11px] font-semibold">Vacsora</span>
+            </button>
+            <button type="button"
+                    class="diet-meal-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-meal="snack">
+              <i class="fa-solid fa-cookie-bite text-lg"></i>
+              <span class="text-[11px] font-semibold">Snack</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megnevezés</label>
+          <input id="diet-input-name" type="text"
+                 placeholder="pl. Zabpehely, Csirke rizs…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-emerald-400 focus:bg-emerald-50/40
+                        transition-all" />
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Kalória (kcal)</label>
+          <input id="diet-input-calories" type="number" min="0" placeholder="0"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-emerald-400 focus:bg-emerald-50/40
+                        transition-all" />
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Makrók (g)</label>
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <input id="diet-input-protein" type="number" min="0" step="0.1"
+                     placeholder="0"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-3 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-emerald-400 transition-all
+                            text-center" />
+              <p class="text-[10px] text-gray-400 text-center mt-1">Protein</p>
+            </div>
+            <div>
+              <input id="diet-input-carbs" type="number" min="0" step="0.1"
+                     placeholder="0"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-3 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-emerald-400 transition-all
+                            text-center" />
+              <p class="text-[10px] text-gray-400 text-center mt-1">Szénhid.</p>
+            </div>
+            <div>
+              <input id="diet-input-fat" type="number" min="0" step="0.1"
+                     placeholder="0"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-3 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-emerald-400 transition-all
+                            text-center" />
+              <p class="text-[10px] text-gray-400 text-center mt-1">Zsír</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Dátum</label>
+          <input id="diet-input-date" type="date"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-700
+                        focus:outline-none focus:border-emerald-400 transition-all" />
+        </div>
+
+        <button id="diet-save-btn"
+                class="w-full py-3.5 rounded-2xl bg-emerald-500 text-white
+                       font-semibold text-sm shadow-sm hover:bg-emerald-600
+                       active:scale-[0.98] transition-all disabled:opacity-60">
+          Étkezés mentése
+        </button>
+        <div class="h-6"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  EDZÉS MODÁLIS ABLAK                                   -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="wo-modal" class="fixed inset-0 z-50 hidden">
+    <div id="wo-modal-backdrop"
+         class="absolute inset-0 bg-black/30 backdrop-blur-sm"></div>
+    <div id="wo-modal-sheet"
+         style="transform: translateY(100%)"
+         class="absolute bottom-0 left-0 right-0 max-w-2xl mx-auto
+                bg-white rounded-t-3xl shadow-2xl">
+
+      <div class="flex justify-center pt-3 pb-2">
+        <div class="w-10 h-1 rounded-full bg-gray-200"></div>
+      </div>
+
+      <div class="flex items-center justify-between px-5 pb-4 border-b border-gray-100">
+        <h2 class="text-lg font-bold text-gray-900">Edzés rögzítése</h2>
+        <button id="wo-modal-close"
+                class="w-8 h-8 rounded-full bg-gray-100 flex items-center
+                       justify-center text-gray-500 hover:bg-gray-200 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <div class="px-5 py-4 overflow-y-auto max-h-[75vh] no-scrollbar">
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Edzés neve</label>
+          <input id="wo-input-name" type="text"
+                 placeholder="pl. Push Day, Láb nap…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-indigo-400 focus:bg-indigo-50/40
+                        transition-all" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div>
+            <label class="text-[11px] font-semibold text-gray-400 uppercase
+                          tracking-widest mb-2 block">Dátum</label>
+            <input id="wo-input-date" type="date"
+                   class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                          px-4 py-3 text-sm text-gray-700
+                          focus:outline-none focus:border-indigo-400 transition-all" />
+          </div>
+          <div>
+            <label class="text-[11px] font-semibold text-gray-400 uppercase
+                          tracking-widest mb-2 block">Időtartam (perc)</label>
+            <input id="wo-input-duration" type="number" min="1" placeholder="60"
+                   class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                          px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                          focus:outline-none focus:border-indigo-400 transition-all" />
+          </div>
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Gyakorlatok (soronként egy)</label>
+          <textarea id="wo-input-exercises" rows="4"
+                    placeholder="pl. Fekvenyomás 100 kg × 5 × 4&#10;Guggolás 120 kg × 5 × 5&#10;Húzódzkodás × 10 × 3"
+                    class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                           px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                           focus:outline-none focus:border-indigo-400 focus:bg-indigo-50/40
+                           transition-all resize-none"></textarea>
+        </div>
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megjegyzés</label>
+          <input id="wo-input-notes" type="text"
+                 placeholder="Hogyan ment az edzés?"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-indigo-400 transition-all" />
+        </div>
+
+        <button id="wo-save-btn"
+                class="w-full py-3.5 rounded-2xl bg-indigo-600 text-white
+                       font-semibold text-sm shadow-sm hover:bg-indigo-700
+                       active:scale-[0.98] transition-all disabled:opacity-60">
+          Edzés mentése
+        </button>
+        <div class="h-6"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  REGENERÁCIÓ / ALVÁS MODÁLIS ABLAK                     -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="rec-modal" class="fixed inset-0 z-50 hidden">
+    <div id="rec-modal-backdrop"
+         class="absolute inset-0 bg-black/30 backdrop-blur-sm"></div>
+    <div id="rec-modal-sheet"
+         style="transform: translateY(100%)"
+         class="absolute bottom-0 left-0 right-0 max-w-2xl mx-auto
+                bg-white rounded-t-3xl shadow-2xl">
+
+      <div class="flex justify-center pt-3 pb-2">
+        <div class="w-10 h-1 rounded-full bg-gray-200"></div>
+      </div>
+
+      <div class="flex items-center justify-between px-5 pb-4 border-b border-gray-100">
+        <h2 class="text-lg font-bold text-gray-900">Alvás naplózása</h2>
+        <button id="rec-modal-close"
+                class="w-8 h-8 rounded-full bg-gray-100 flex items-center
+                       justify-center text-gray-500 hover:bg-gray-200 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <div class="px-5 py-4 overflow-y-auto max-h-[75vh] no-scrollbar">
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Kelt napja</label>
+          <input id="rec-input-date" type="date"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-700
+                        focus:outline-none focus:border-violet-400 transition-all" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div>
+            <label class="text-[11px] font-semibold text-gray-400 uppercase
+                          tracking-widest mb-2 block">Lefekvés</label>
+            <input id="rec-input-bedtime" type="time"
+                   class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                          px-4 py-3 text-sm text-gray-700
+                          focus:outline-none focus:border-violet-400 transition-all" />
+          </div>
+          <div>
+            <label class="text-[11px] font-semibold text-gray-400 uppercase
+                          tracking-widest mb-2 block">Ébredés</label>
+            <input id="rec-input-wakeup" type="time"
+                   class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                          px-4 py-3 text-sm text-gray-700
+                          focus:outline-none focus:border-violet-400 transition-all" />
+          </div>
+        </div>
+
+        <div id="rec-duration-preview"
+             class="hidden mb-4 bg-violet-50 border border-violet-100 rounded-2xl
+                    px-4 py-3 flex items-center justify-between">
+          <div>
+            <p class="text-xs font-semibold text-violet-500">Alvás hossza</p>
+            <p class="text-[11px] text-violet-300 mt-0.5">Automatikusan számolva</p>
+          </div>
+          <p id="rec-duration-value"
+             class="text-2xl font-bold text-violet-600 tabular-nums">— ó</p>
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-3 block">Alvás minősége</label>
+          <div class="flex gap-2 justify-center">
+            <button type="button"
+                    class="rec-quality-btn w-12 h-12 rounded-2xl border-2
+                           border-gray-100 bg-gray-50 text-xl transition-all" data-q="1">😴</button>
+            <button type="button"
+                    class="rec-quality-btn w-12 h-12 rounded-2xl border-2
+                           border-gray-100 bg-gray-50 text-xl transition-all" data-q="2">😑</button>
+            <button type="button"
+                    class="rec-quality-btn w-12 h-12 rounded-2xl border-2
+                           border-gray-100 bg-gray-50 text-xl transition-all" data-q="3">🙂</button>
+            <button type="button"
+                    class="rec-quality-btn w-12 h-12 rounded-2xl border-2
+                           border-gray-100 bg-gray-50 text-xl transition-all" data-q="4">😊</button>
+            <button type="button"
+                    class="rec-quality-btn w-12 h-12 rounded-2xl border-2
+                           border-gray-100 bg-gray-50 text-xl transition-all" data-q="5">🤩</button>
+          </div>
+        </div>
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megjegyzés</label>
+          <input id="rec-input-notes" type="text"
+                 placeholder="pl. Nehezen aludtam el…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-violet-400 transition-all" />
+        </div>
+
+        <button id="rec-save-btn"
+                class="w-full py-3.5 rounded-2xl bg-violet-600 text-white
+                       font-semibold text-sm shadow-sm hover:bg-violet-700
+                       active:scale-[0.98] transition-all disabled:opacity-60">
+          Alvás mentése
+        </button>
+        <div class="h-6"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  PR HUB / REKORDOK MODÁLIS ABLAK                       -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="pr-modal" class="fixed inset-0 z-50 hidden">
+    <div id="pr-modal-backdrop"
+         class="absolute inset-0 bg-black/30 backdrop-blur-sm"></div>
+    <div id="pr-modal-sheet"
+         style="transform: translateY(100%)"
+         class="absolute bottom-0 left-0 right-0 max-w-2xl mx-auto
+                bg-white rounded-t-3xl shadow-2xl">
+
+      <div class="flex justify-center pt-3 pb-2">
+        <div class="w-10 h-1 rounded-full bg-gray-200"></div>
+      </div>
+
+      <div class="flex items-center justify-between px-5 pb-4 border-b border-gray-100">
+        <h2 class="text-lg font-bold text-gray-900">Új rekord</h2>
+        <button id="pr-modal-close"
+                class="w-8 h-8 rounded-full bg-gray-100 flex items-center
+                       justify-center text-gray-500 hover:bg-gray-200 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <div class="px-5 py-4 overflow-y-auto max-h-[75vh] no-scrollbar">
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-3 block">Kategória</label>
+          <div class="grid grid-cols-4 gap-2" id="pr-cat-selector">
+            <button type="button"
+                    class="pr-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="strength">
+              <i class="fa-solid fa-dumbbell text-lg"></i>
+              <span class="text-[11px] font-semibold">Súlyzós</span>
+            </button>
+            <button type="button"
+                    class="pr-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="running">
+              <i class="fa-solid fa-person-running text-lg"></i>
+              <span class="text-[11px] font-semibold">Futás</span>
+            </button>
+            <button type="button"
+                    class="pr-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="cycling">
+              <i class="fa-solid fa-bicycle text-lg"></i>
+              <span class="text-[11px] font-semibold">Kerékpár</span>
+            </button>
+            <button type="button"
+                    class="pr-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="swimming">
+              <i class="fa-solid fa-person-swimming text-lg"></i>
+              <span class="text-[11px] font-semibold">Úszás</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megnevezés</label>
+          <input id="pr-input-name" type="text"
+                 placeholder="pl. Guggolás, 5 km futás…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                        transition-all" />
+        </div>
+
+        <div id="pr-strength-fields" class="mb-4">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="text-[11px] font-semibold text-gray-400 uppercase
+                            tracking-widest mb-2 block">Súly (kg)</label>
+              <input id="pr-input-weight" type="number" min="0" step="0.5"
+                     placeholder="0"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                            transition-all" />
+            </div>
+            <div>
+              <label class="text-[11px] font-semibold text-gray-400 uppercase
+                            tracking-widest mb-2 block">Ismétlés</label>
+              <input id="pr-input-reps" type="number" min="1" max="50"
+                     placeholder="0"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                            transition-all" />
+            </div>
+          </div>
+
+          <div id="pr-1rm-preview"
+               class="hidden mt-3 bg-amber-50 border border-amber-100 rounded-2xl
+                      px-4 py-3 flex items-center justify-between">
+            <div>
+              <p class="text-xs font-semibold text-amber-500">Becsült 1RM</p>
+              <p class="text-[11px] text-amber-300 mt-0.5">Epley-formula</p>
+            </div>
+            <p id="pr-1rm-value"
+               class="text-2xl font-bold text-amber-600 tabular-nums">— kg</p>
+          </div>
+        </div>
+
+        <div id="pr-cardio-fields" class="hidden mb-4">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="text-[11px] font-semibold text-gray-400 uppercase
+                            tracking-widest mb-2 block">Távolság (km)</label>
+              <input id="pr-input-distance" type="number" min="0" step="0.01"
+                     placeholder="0.00"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                            transition-all" />
+            </div>
+            <div>
+              <label class="text-[11px] font-semibold text-gray-400 uppercase
+                            tracking-widest mb-2 block">Idő</label>
+              <input id="pr-input-duration" type="text"
+                     placeholder="pl. 45:30"
+                     class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                            px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                            focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                            transition-all" />
+            </div>
+          </div>
+        </div>
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Dátum</label>
+          <input id="pr-input-date" type="date"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-700
+                        focus:outline-none focus:border-amber-400 focus:bg-amber-50/40
+                        transition-all" />
+        </div>
+
+        <button id="pr-save-btn"
+                class="w-full py-3.5 rounded-2xl bg-amber-500 text-white
+                       font-semibold text-sm shadow-sm hover:bg-amber-600
+                       active:scale-[0.98] transition-all disabled:opacity-60">
+          Rekord mentése
+        </button>
+        <div class="h-6"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <!--  DOKUMENTUMOK MODÁLIS ABLAK                            -->
+  <!-- ═══════════════════════════════════════════════════════ -->
+  <div id="doc-modal" class="fixed inset-0 z-50 hidden">
+    <div id="doc-modal-backdrop"
+         class="absolute inset-0 bg-black/30 backdrop-blur-sm"></div>
+    <div id="doc-modal-sheet"
+         style="transform: translateY(100%)"
+         class="absolute bottom-0 left-0 right-0 max-w-2xl mx-auto
+                bg-white rounded-t-3xl shadow-2xl">
+
+      <div class="flex justify-center pt-3 pb-2">
+        <div class="w-10 h-1 rounded-full bg-gray-200"></div>
+      </div>
+
+      <div class="flex items-center justify-between px-5 pb-4 border-b border-gray-100">
+        <h2 class="text-lg font-bold text-gray-900">Dokumentum rögzítése</h2>
+        <button id="doc-modal-close"
+                class="w-8 h-8 rounded-full bg-gray-100 flex items-center
+                       justify-center text-gray-500 hover:bg-gray-200 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <div class="px-5 py-4 overflow-y-auto max-h-[75vh] no-scrollbar">
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-3 block">Kategória</label>
+          <div class="grid grid-cols-4 gap-2">
+            <button type="button"
+                    class="doc-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="lelet">
+              <i class="fa-solid fa-flask text-lg"></i>
+              <span class="text-[11px] font-semibold">Lelet</span>
+            </button>
+            <button type="button"
+                    class="doc-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="recept">
+              <i class="fa-solid fa-prescription text-lg"></i>
+              <span class="text-[11px] font-semibold">Recept</span>
+            </button>
+            <button type="button"
+                    class="doc-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="vizsgalat">
+              <i class="fa-solid fa-stethoscope text-lg"></i>
+              <span class="text-[11px] font-semibold">Vizsgálat</span>
+            </button>
+            <button type="button"
+                    class="doc-cat-btn flex flex-col items-center gap-1.5
+                           py-3 rounded-2xl border-2 transition-all" data-cat="egyeb">
+              <i class="fa-solid fa-file text-lg"></i>
+              <span class="text-[11px] font-semibold">Egyéb</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megnevezés</label>
+          <input id="doc-input-name" type="text"
+                 placeholder="pl. Vérképeredmény, EKG lelet…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-cyan-400 focus:bg-cyan-50/40
+                        transition-all" />
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Dátum</label>
+          <input id="doc-input-date" type="date"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-700
+                        focus:outline-none focus:border-cyan-400 transition-all" />
+        </div>
+
+        <div class="mb-4">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Megjegyzés / eredmény</label>
+          <textarea id="doc-input-notes" rows="3"
+                    placeholder="Ide írhatod a főbb eredményeket, megjegyzéseket…"
+                    class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                           px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                           focus:outline-none focus:border-cyan-400 focus:bg-cyan-50/40
+                           transition-all resize-none"></textarea>
+        </div>
+
+        <div class="mb-5">
+          <label class="text-[11px] font-semibold text-gray-400 uppercase
+                        tracking-widest mb-2 block">Link (opcionális)</label>
+          <input id="doc-input-url" type="url" placeholder="https://…"
+                 class="w-full bg-gray-50 border border-gray-200 rounded-2xl
+                        px-4 py-3 text-sm text-gray-800 placeholder-gray-300
+                        focus:outline-none focus:border-cyan-400 transition-all" />
+        </div>
+
+        <button id="doc-save-btn"
+                class="w-full py-3.5 rounded-2xl bg-cyan-500 text-white
+                       font-semibold text-sm shadow-sm hover:bg-cyan-600
+                       active:scale-[0.98] transition-all disabled:opacity-60">
+          Dokumentum mentése
+        </button>
+        <div class="h-6"></div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ── JS belépési pont (ES module) ──────────────────────── -->
+  <script type="module" src="./js/app.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,5899 @@
+// ============================================================
+// activity.js — Aktivitás, WHOOP 4.0 Dashboard, Edzés & Recovery
+// FitPlan Pro | Elektromos Kék / Neon Téma
+// WHOOP 4.0 Analitika, Garmin Sportágak, Gyakorlattár, Rutinok,
+// Regenerációs Protokollok (SMR/Nyújtás) és Felszerelések (Gear)
+// ============================================================
+
+import { db, auth } from '../firebase-config.js';
+import {
+  GARMIN_SPORTS,
+  getSportById,
+  GARMIN_DATAFIELDS,
+  getDatafieldById,
+  DEFAULT_EXERCISES,
+  calcWorkoutSweatLoss
+} from '../garmin-sports.js';
+import {
+  collection,
+  addDoc,
+  deleteDoc,
+  doc,
+  setDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  serverTimestamp,
+  updateDoc,
+  increment
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+import { openWorkoutDetailModal } from './whoop5.js';
+import { mapIntervalsTypeToSportId } from './intervals.js';
+
+// ── DOM segéd ──────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function todayString() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function formatDateHU(dateStr) {
+  if (!dateStr) return '';
+  const parts = dateStr.split('-');
+  if (parts.length !== 3) return dateStr;
+  const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+  const months = ['január', 'február', 'március', 'április', 'május', 'június', 'július', 'augusztus', 'szeptember', 'október', 'november', 'december'];
+  const days = ['Vasárnap', 'Hétfő', 'Kedd', 'Szerda', 'Csütörtök', 'Péntek', 'Szombat'];
+  return `${parts[0]}. ${months[d.getMonth()]} ${Number(parts[2])}., ${days[d.getDay()]}`;
+}
+
+function formatMinutesToHours(mins) {
+  if (!mins || mins <= 0) return '0ó 0p';
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  if (h === 0) return `${m}p`;
+  return `${h}ó ${m}p`;
+}
+
+function _esc(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// ── Garmin Alvási Fázisok (Deep, REM, Light, Awake) kinyerése & Firstbeat modell ──
+export function extractGarminSleepStages(w, sleepActualMin, sleepScore, dateStr) {
+  const totalMins = (sleepActualMin !== undefined && sleepActualMin !== null && !isNaN(Number(sleepActualMin)))
+    ? Math.max(0, Math.round(Number(sleepActualMin)))
+    : null;
+
+  if (!totalMins || totalMins <= 0) {
+    return { deepMin: 0, remMin: 0, lightMin: 0, awakeMin: 0, isGarminMeasured: false };
+  }
+
+  const extractStageMins = (secKeys, minKeys, genericKeys) => {
+    if (!w || typeof w !== 'object') return null;
+
+    // 1. Közvetlen másodperc alapú kulcsok (mindig osztandó 60-nal)
+    for (const k of secKeys) {
+      if (w[k] !== undefined && w[k] !== null && w[k] !== '') {
+        const val = Number(w[k]);
+        if (!isNaN(val) && val >= 0) return Math.round(val / 60);
+      }
+    }
+
+    // 2. Közvetlen perc alapú kulcsok (már percekben van)
+    for (const k of minKeys) {
+      if (w[k] !== undefined && w[k] !== null && w[k] !== '') {
+        const val = Number(w[k]);
+        if (!isNaN(val) && val >= 0) return Math.round(val);
+      }
+    }
+
+    // 3. Beágyazott stages / sleepStages objektum
+    const nested = w.stages || w.sleepStages || w.sleep_stages || (typeof w.sleep === 'object' ? w.sleep : null);
+    if (nested && typeof nested === 'object') {
+      for (const k of secKeys) {
+        if (nested[k] !== undefined && nested[k] !== null && nested[k] !== '') {
+          const val = Number(nested[k]);
+          if (!isNaN(val) && val >= 0) return Math.round(val / 60);
+        }
+      }
+      for (const k of minKeys) {
+        if (nested[k] !== undefined && nested[k] !== null && nested[k] !== '') {
+          const val = Number(nested[k]);
+          if (!isNaN(val) && val >= 0) return Math.round(val);
+        }
+      }
+      for (const k of genericKeys) {
+        if (nested[k] !== undefined && nested[k] !== null && nested[k] !== '') {
+          const val = Number(nested[k]);
+          if (!isNaN(val) && val >= 0) {
+            if (val > 1200 || (totalMins && val > totalMins * 1.2)) return Math.round(val / 60);
+            if (val > 0 && val <= 24 && !Number.isInteger(val)) return Math.round(val * 60);
+            return Math.round(val);
+          }
+        }
+      }
+    }
+
+    // 4. Egyéni mezők (customFields objektum vagy tömb)
+    const custom = w.customFields || w.custom_fields || w.fields;
+    if (custom) {
+      const checkKey = (rawKey, val) => {
+        const clean = String(rawKey || '').toLowerCase().replace(/[\s_\-]+/g, '');
+        for (const k of secKeys) {
+          if (clean === k.toLowerCase().replace(/[\s_\-]+/g, '')) {
+            const v = Number(val);
+            if (!isNaN(v) && v >= 0) return Math.round(v / 60);
+          }
+        }
+        for (const k of minKeys) {
+          if (clean === k.toLowerCase().replace(/[\s_\-]+/g, '')) {
+            const v = Number(val);
+            if (!isNaN(v) && v >= 0) return Math.round(v);
+          }
+        }
+        for (const k of genericKeys) {
+          if (clean === k.toLowerCase().replace(/[\s_\-]+/g, '')) {
+            const v = Number(val);
+            if (!isNaN(v) && v >= 0) {
+              if (v > 1200 || (totalMins && v > totalMins * 1.2)) return Math.round(v / 60);
+              return Math.round(v);
+            }
+          }
+        }
+        return null;
+      };
+
+      if (Array.isArray(custom)) {
+        for (const cf of custom) {
+          if (!cf) continue;
+          const res = checkKey(cf.id || cf.name || cf.code, cf.value ?? cf.val);
+          if (res !== null) return res;
+        }
+      } else if (typeof custom === 'object') {
+        for (const [k, v] of Object.entries(custom)) {
+          const res = checkKey(k, v);
+          if (res !== null) return res;
+        }
+      }
+    }
+
+    // 5. Generikus kulcsok w gyökerében (másodperc vs perc intelligens vizsgálata)
+    for (const k of genericKeys) {
+      if (w[k] !== undefined && w[k] !== null && w[k] !== '') {
+        const val = Number(w[k]);
+        if (!isNaN(val) && val >= 0) {
+          if (val > 1200 || (totalMins && val > totalMins * 1.2)) {
+            return Math.round(val / 60);
+          }
+          if (val > 0 && val <= 24 && !Number.isInteger(val)) {
+            return Math.round(val * 60);
+          }
+          return Math.round(val);
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const deepSecKeys = ['deep_sleep_sec', 'deep_sleep_secs', 'deep_sleep_seconds', 'deepSleepSeconds', 'deepSleepSecs', 'deepSecs', 'icu_deep_sleep_sec'];
+  const deepMinKeys = ['deep_sleep_min', 'deep_sleep_mins', 'deep_sleep_minutes', 'deepSleepMinutes', 'deepSleepMins', 'deepMin', 'deepMins'];
+  const deepGenKeys = ['deepSleep', 'deep_sleep', 'deep', 'DeepSleep', 'Deep', 'mely', 'mely_alvas'];
+
+  const remSecKeys = ['rem_sleep_sec', 'rem_sleep_secs', 'rem_sleep_seconds', 'remSleepSeconds', 'remSleepSecs', 'remSecs', 'icu_rem_sleep_sec'];
+  const remMinKeys = ['rem_sleep_min', 'rem_sleep_mins', 'rem_sleep_minutes', 'remSleepMinutes', 'remSleepMins', 'remMin', 'remMins'];
+  const remGenKeys = ['remSleep', 'rem_sleep', 'rem', 'REMSleep', 'REM'];
+
+  const lightSecKeys = ['light_sleep_sec', 'light_sleep_secs', 'light_sleep_seconds', 'lightSleepSeconds', 'lightSleepSecs', 'lightSecs', 'icu_light_sleep_sec'];
+  const lightMinKeys = ['light_sleep_min', 'light_sleep_mins', 'light_sleep_minutes', 'lightSleepMinutes', 'lightSleepMins', 'lightMin', 'lightMins'];
+  const lightGenKeys = ['lightSleep', 'light_sleep', 'light', 'LightSleep', 'Light', 'konnyu', 'konnyu_alvas'];
+
+  const awakeSecKeys = ['awake_sec', 'awake_secs', 'awake_sleep_sec', 'awake_sleep_secs', 'awake_sleep_seconds', 'awakeSleepSeconds', 'awakeSleepSecs', 'awakeSecs', 'awakeTimeSecs', 'awake_time_sec', 'awake_time_secs', 'icu_awake_sec'];
+  const awakeMinKeys = ['awake_min', 'awake_mins', 'awake_sleep_min', 'awake_sleep_mins', 'awakeSleepMinutes', 'awakeMin', 'awakeMins', 'awakeTimeMinutes', 'awake_time_min'];
+  const awakeGenKeys = ['awakeTime', 'awake_time', 'awakeSleep', 'awake_sleep', 'awake', 'AwakeTime', 'Awake', 'ebren', 'ebrenlet'];
+
+  let rawDeep = extractStageMins(deepSecKeys, deepMinKeys, deepGenKeys);
+  let rawRem = extractStageMins(remSecKeys, remMinKeys, remGenKeys);
+  let rawLight = extractStageMins(lightSecKeys, lightMinKeys, lightGenKeys);
+  let rawAwake = extractStageMins(awakeSecKeys, awakeMinKeys, awakeGenKeys);
+
+  // Ha a válasz tartalmazott konkrét mért fázisokat:
+  if (rawDeep !== null || rawRem !== null || rawLight !== null || rawAwake !== null) {
+    let deepMin = rawDeep ?? 0;
+    let remMin = rawRem ?? 0;
+    let lightMin = rawLight ?? 0;
+    let awakeMin = rawAwake ?? 0;
+
+    if (rawLight === null && totalMins > 0) {
+      lightMin = Math.max(0, totalMins - (deepMin + remMin));
+    }
+
+    return {
+      deepMin,
+      remMin,
+      lightMin,
+      awakeMin,
+      isGarminMeasured: true
+    };
+  }
+
+  // 5. HA A GARMIN CSAK A SLEEP SCORE-T ÉS A TELJES ALVÁSIDŐT KÜLDTE ÁT:
+  // Firstbeat / Garmin hivatalos alvási architektúra szerinti pontszám-vezérelt lebontás
+  let score = 80;
+  if (sleepScore !== null && sleepScore !== undefined && !isNaN(Number(sleepScore))) {
+    score = Math.min(100, Math.max(15, Math.round(Number(sleepScore))));
+  }
+
+  let seed = 0;
+  if (dateStr && typeof dateStr === 'string') {
+    for (let i = 0; i < dateStr.length; i++) {
+      seed = (seed * 31 + dateStr.charCodeAt(i)) % 1000;
+    }
+  }
+  const varianceFactor = ((seed % 100) - 50) / 100.0;
+
+  const normScore = (score - 50.0) / 50.0;
+
+  let deepFrac = Math.max(0.08, Math.min(0.25, 0.17 + (normScore * 0.055) + (varianceFactor * 0.015)));
+  let remFrac = Math.max(0.10, Math.min(0.26, 0.18 + (normScore * 0.055) - (varianceFactor * 0.015)));
+  let awakeFrac = Math.max(0.02, Math.min(0.18, 0.06 - (normScore * 0.04) + (Math.abs(varianceFactor) * 0.012)));
+
+  const deepMin = Math.round(totalMins * deepFrac);
+  const remMin = Math.round(totalMins * remFrac);
+  const awakeMin = Math.max(1, Math.round(totalMins * awakeFrac));
+  const lightMin = Math.max(0, totalMins - (deepMin + remMin));
+
+  return {
+    deepMin,
+    remMin,
+    lightMin,
+    awakeMin,
+    isGarminMeasured: false
+  };
+}
+
+// ── Beépített minta adatok (kategóriánként max 1 minta sablon, törölhető) ────
+const DEFAULT_ROUTINES = [
+  {
+    id: 'default_routine_1',
+    isSample: true,
+    name: 'Push Nap (Mell, Váll, Tricepsz)',
+    sportId: 'strength_training',
+    category: 'strength',
+    duration: 65,
+    exercises: 'Fekvenyomás rúddal: 4 × 8 (80 kg)\nFerdepados kézisúlyzós nyomás: 3 × 10 (26 kg)\nVállból nyomás ülve: 3 × 10 (20 kg)\nOldalemelés kézisúllyal: 4 × 15 (10 kg)\nTricepsz letolás csigán: 3 × 12 (35 kg)',
+    notes: 'Kiváló feszülés a mellizmokban, progresszív terhelés'
+  },
+  {
+    id: 'default_routine_endurance_1',
+    isSample: true,
+    name: '5 km Zóna 2 Kardió Futás',
+    sportId: 'running',
+    category: 'endurance',
+    duration: 35,
+    distanceKm: 5,
+    exercises: 'Bemelegítő dinamikus nyújtás: 5 perc (Zóna 1)\nEgyenletes Zóna 2 alapozó futás: 5 km (Zóna 2)\nLevezető séta és légzés: 5 perc (Zóna 1)',
+    notes: 'Beszélgetős tempó, pulzus 135-145 bpm között tartva'
+  }
+];
+
+const DEFAULT_RECOVERY_PROTOCOLS = [
+  {
+    id: 'default_protocol_1',
+    isSample: true,
+    name: 'Teljes test SMR Hengerezés & Mobilitás',
+    type: 'smr',
+    category: 'recovery',
+    duration: 20,
+    relievedMuscles: ['all'],
+    relievedMuscle: 'all',
+    relievedMuscleLabel: 'Teljes test',
+    exercises: 'Vádli és Achilles hengerezés: 1 × 4p\nCombfeszítő és combközelítő: 1 × 6p\nIT-szalag és gluteus fókusz: 1 × 6p\nHáti gerinc extenzió és lapocka mobilitás: 1 × 4p',
+    notes: 'Feszes trigger pontokon 30 mp tartás mély kilégzéssel'
+  }
+];
+
+function _getDeletedSampleIds(key) {
+  try {
+    const userKey = _uid ? `lockin_deleted_sample_${key}_${_uid}` : `lockin_deleted_sample_${key}_default`;
+    const raw = localStorage.getItem(userKey) || localStorage.getItem(`lockin_deleted_sample_${key}_default`);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function _markSampleDeleted(key, id) {
+  try {
+    const list = _getDeletedSampleIds(key);
+    if (!list.includes(id)) {
+      list.push(id);
+      const userKey = _uid ? `lockin_deleted_sample_${key}_${_uid}` : `lockin_deleted_sample_${key}_default`;
+      localStorage.setItem(userKey, JSON.stringify(list));
+      localStorage.setItem(`lockin_deleted_sample_${key}_default`, JSON.stringify(list));
+    }
+  } catch (e) {
+    console.error('Error saving deleted sample:', e);
+  }
+}
+
+// ── Belső Állapot ──────────────────────────────────────────
+let _uid = null;
+let _selectedDate = todayString();
+let _activeSubtab = 'whoop'; // 'whoop' | 'workouts' | 'routines' | 'recovery' | 'gear'
+let _trendDays = 7; // 7 vagy 30 nap
+
+let _unsubWhoop = null;
+let _unsubWorkouts = null;
+let _unsubRoutines = null;
+let _unsubExercises = null;
+let _unsubGears = null;
+let _unsubSleep = null;
+let _unsubProtocols = null;
+
+let _allWhoopLogs = {}; // date -> log object
+let _allWorkouts = [];
+let _allRoutines = [];
+let _allExercises = [];
+let _allGears = [];
+let _allSleepLogs = [];
+let _allProtocols = [];
+
+let _uiInitialized = false;
+let _activeExerciseTarget = 'workout'; // 'workout' | 'routine' | 'recovery' | 'detail'
+let _templateActiveCategory = 'endurance'; // 'endurance' | 'strength' | 'recovery'
+let _templateActiveSub = 'programs'; // 'programs' | 'exercises'
+let _unifiedTemplateSearchQuery = '';
+let _unifiedExerciseSearchQuery = '';
+
+// Alkategóriák és Kijelölés állapota
+const DEFAULT_SUBCATEGORIES = {
+  endurance: ['Futás', 'Kerékpár', 'Úszás', 'Evezés / Kardió', 'Gyaloglás / Túra'],
+  strength: ['Felsőtest', 'Alsótest', 'Core / Törzs', 'Push / Nyomás', 'Pull / Húzás', 'Teljes test'],
+  recovery: ['SMR & Hengerezés', 'Nyújtás & Mobilitás', 'Légzés & Fókusz', 'Szauna & Hidegterápia']
+};
+
+function _getCategoryKey(category) {
+  const c = (category || '').toLowerCase().trim();
+  if (c === 'állóképességi' || c === 'allokepessegi' || c === 'endurance' || c === 'kardió' || c === 'kardio' || c === 'cardio') {
+    return 'endurance';
+  }
+  if (c === 'regeneráció' || c === 'regeneracio' || c === 'recovery' || c === 'smr' || c === 'nyújtás' || c === 'nyujtas' || c === 'hideg/meleg' || c === 'légzés' || c === 'legzes' || c === 'mobilitás' || c === 'mobilitas') {
+    return 'recovery';
+  }
+  return 'strength';
+}
+
+function _getCategoryLabel(keyOrCat) {
+  const k = _getCategoryKey(keyOrCat);
+  if (k === 'endurance') return 'Állóképességi';
+  if (k === 'recovery') return 'Regeneráció';
+  return 'Erőfejlesztő';
+}
+
+function _updateExerciseSubcatDropdown(preferredSubcat = null) {
+  const catIn = $('wo-new-ex-cat');
+  const subcatIn = $('wo-new-ex-subcat');
+  if (!subcatIn) return;
+
+  const currentCat = catIn?.value || 'Erőfejlesztő';
+  const catKey = _getCategoryKey(currentCat);
+
+  const defaultSubs = DEFAULT_SUBCATEGORIES[catKey] || [];
+  const customSubs = _customSubcategories
+    .filter(s => s.mainCategory === catKey && s.name)
+    .map(s => s.name);
+
+  const uniqueSubs = [];
+  const seen = new Set();
+  [...defaultSubs, ...customSubs].forEach(s => {
+    const trimmed = (s || '').trim();
+    if (trimmed && !seen.has(trimmed.toLowerCase())) {
+      seen.add(trimmed.toLowerCase());
+      uniqueSubs.push(trimmed);
+    }
+  });
+
+  const curVal = preferredSubcat !== null ? preferredSubcat : (subcatIn.value || '');
+  if (curVal && !seen.has(curVal.toLowerCase()) && curVal !== '__new__') {
+    uniqueSubs.push(curVal);
+  }
+
+  let optionsHtml = '<option value="">-- Válassz alkategóriát (opcionális) --</option>';
+  uniqueSubs.forEach(s => {
+    optionsHtml += `<option value="${_esc(s)}">${_esc(s)}</option>`;
+  });
+  optionsHtml += '<option value="__new__">+ Új alkategória létrehozása...</option>';
+
+  subcatIn.innerHTML = optionsHtml;
+  if (curVal && curVal !== '__new__') {
+    subcatIn.value = curVal;
+  } else {
+    subcatIn.value = '';
+  }
+}
+
+let _customSubcategories = [];
+let _activeTemplateSubcategory = 'all'; // 'all' (Összes) vagy adott alkategória neve
+let _unsubSubcategories = null;
+
+// Multi-select (Kijelölés) állapot gyakorlat beemeléshez
+let _isExerciseMultiSelectMode = false;
+let _selectedExercisesForBatch = new Map(); // id/name -> exercise item object
+
+// ── Felhasználói Azonosító és Helyi Gyorsítótár Kezelése ──
+function _getEffectiveUid() {
+  if (_uid) return _uid;
+  try {
+    if (auth && auth.currentUser && auth.currentUser.uid) {
+      _uid = auth.currentUser.uid;
+      return _uid;
+    }
+  } catch (e) {}
+  const localGuest = localStorage.getItem('lockin_guest_uid');
+  if (localGuest) {
+    _uid = localGuest;
+    return _uid;
+  }
+  const localUserStr = localStorage.getItem('lockin_local_user');
+  if (localUserStr) {
+    try {
+      const u = JSON.parse(localUserStr);
+      if (u && u.uid) {
+        _uid = u.uid;
+        return _uid;
+      }
+    } catch (e) {}
+  }
+  _uid = 'local_user';
+  return _uid;
+}
+
+function _loadCachedActivityData(uid) {
+  const effUid = uid || _getEffectiveUid();
+  if (!effUid) return;
+  try {
+    const cachedEx = localStorage.getItem('lockin_custom_exercises_' + effUid);
+    if (cachedEx) {
+      const parsed = JSON.parse(cachedEx);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        _allExercises = parsed;
+      }
+    }
+    const cachedRt = localStorage.getItem('lockin_custom_routines_' + effUid);
+    if (cachedRt) {
+      const parsed = JSON.parse(cachedRt);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        _allRoutines = parsed;
+      }
+    }
+    const cachedProto = localStorage.getItem('lockin_custom_protocols_' + effUid);
+    if (cachedProto) {
+      const parsed = JSON.parse(cachedProto);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        _allProtocols = parsed;
+      }
+    }
+    const cachedSub = localStorage.getItem('lockin_custom_subcategories_' + effUid);
+    if (cachedSub) {
+      const parsed = JSON.parse(cachedSub);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        _customSubcategories = parsed;
+      }
+    }
+  } catch (e) {
+    console.warn('[activity] Error loading cached data:', e);
+  }
+}
+
+function _saveExercisesToLocal(uid) {
+  try {
+    localStorage.setItem('lockin_custom_exercises_' + (uid || _getEffectiveUid()), JSON.stringify(_allExercises));
+  } catch (e) {}
+}
+
+function _saveRoutinesToLocal(uid) {
+  try {
+    localStorage.setItem('lockin_custom_routines_' + (uid || _getEffectiveUid()), JSON.stringify(_allRoutines));
+  } catch (e) {}
+}
+
+function _saveProtocolsToLocal(uid) {
+  try {
+    localStorage.setItem('lockin_custom_protocols_' + (uid || _getEffectiveUid()), JSON.stringify(_allProtocols));
+  } catch (e) {}
+}
+
+function _saveSubcatsToLocal(uid) {
+  try {
+    localStorage.setItem('lockin_custom_subcategories_' + (uid || _getEffectiveUid()), JSON.stringify(_customSubcategories));
+  } catch (e) {}
+}
+
+// ── Publikus Inicializáló és Leállító Függvények ───────────
+export function initActivity(uid) {
+  _uid = uid || _getEffectiveUid();
+  _selectedDate = todayString();
+  _activeSubtab = 'whoop';
+
+  _loadCachedActivityData(_uid);
+
+  if (!_uiInitialized) {
+    _bindUIEvents();
+    _uiInitialized = true;
+  }
+
+  // Azonnali offline/gyorsítótárazott megjelenítés
+  _renderRoutinesList();
+  _renderProtocolsList();
+  _renderExercisesList();
+  _renderUnifiedSubcategoriesBar();
+  _updateSubcategoryDatalists();
+  if (typeof _renderUnifiedProgramsList === 'function') _renderUnifiedProgramsList();
+  if (typeof _renderUnifiedExercisesList === 'function') _renderUnifiedExercisesList();
+
+  _subscribeToData();
+}
+
+export function destroyActivity() {
+  _uid = null;
+  if (_unsubWhoop) { _unsubWhoop(); _unsubWhoop = null; }
+  if (_unsubWorkouts) { _unsubWorkouts(); _unsubWorkouts = null; }
+  if (_unsubRoutines) { _unsubRoutines(); _unsubRoutines = null; }
+  if (_unsubExercises) { _unsubExercises(); _unsubExercises = null; }
+  if (_unsubGears) { _unsubGears(); _unsubGears = null; }
+  if (_unsubSleep) { _unsubSleep(); _unsubSleep = null; }
+  if (_unsubProtocols) { _unsubProtocols(); _unsubProtocols = null; }
+  if (_unsubSubcategories) { _unsubSubcategories(); _unsubSubcategories = null; }
+
+  _allWhoopLogs = {};
+  _allWorkouts = [];
+  _allRoutines = [];
+  _allExercises = [];
+  _allGears = [];
+  _allSleepLogs = [];
+  _allProtocols = [];
+  _customSubcategories = [];
+  _activeTemplateSubcategory = 'all';
+  _isExerciseMultiSelectMode = false;
+  _selectedExercisesForBatch.clear();
+}
+
+// ── Adatbázis Figyelők (Real-time onSnapshot) ───────────────
+function _subscribeToData() {
+  const effUid = _uid || _getEffectiveUid();
+  if (!effUid) return;
+
+  _loadCachedActivityData(effUid);
+
+  // Meglévő figyelők biztonságos leiratkozása újrafeliratkozás előtt
+  if (_unsubWhoop) { _unsubWhoop(); _unsubWhoop = null; }
+  if (_unsubWorkouts) { _unsubWorkouts(); _unsubWorkouts = null; }
+  if (_unsubRoutines) { _unsubRoutines(); _unsubRoutines = null; }
+  if (_unsubExercises) { _unsubExercises(); _unsubExercises = null; }
+  if (_unsubGears) { _unsubGears(); _unsubGears = null; }
+  if (_unsubSleep) { _unsubSleep(); _unsubSleep = null; }
+  if (_unsubProtocols) { _unsubProtocols(); _unsubProtocols = null; }
+  if (_unsubSubcategories) { _unsubSubcategories(); _unsubSubcategories = null; }
+
+  // Helyi vendég esetén nem szükséges a Firestore snapshotokra várni
+  if (effUid.startsWith('local_')) {
+    _renderRoutinesList();
+    _renderProtocolsList();
+    _renderExercisesList();
+    _renderUnifiedProgramsList();
+    _renderUnifiedExercisesList();
+    _renderUnifiedSubcategoriesBar();
+    _updateSubcategoryDatalists();
+    return;
+  }
+
+  // 1. WHOOP biometrikus naplók
+  const qWhoop = query(collection(db, 'users', effUid, 'whoopLogs'));
+  _unsubWhoop = onSnapshot(qWhoop, snap => {
+    _allWhoopLogs = {};
+    snap.docs.forEach(d => {
+      _allWhoopLogs[d.id] = { id: d.id, ...d.data() };
+    });
+    _renderWhoopDashboard();
+    _renderTrendChart();
+  }, err => console.error('[activity] WHOOP sync error:', err));
+
+  // 2. Edzések
+  const qWorkouts = query(collection(db, 'users', effUid, 'workouts'), orderBy('createdAt', 'desc'));
+  _unsubWorkouts = onSnapshot(qWorkouts, snap => {
+    _allWorkouts = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    _allWorkouts.forEach(w => {
+      if ((w.source === 'intervals.icu' || w.intervalsId) && !w.customSport) {
+        if (!w.sportId || w.sportId === 'running') {
+          const autoSport = mapIntervalsTypeToSportId(w.type, w.name, w.notes);
+          if (autoSport && autoSport !== 'running') {
+            w.sportId = autoSport;
+          }
+        }
+      }
+    });
+    if (typeof window !== 'undefined') {
+      window._allWorkoutsActivity = _allWorkouts;
+      window._renderWorkoutsList = _renderWorkoutsList;
+    }
+    _renderWorkoutsList();
+    _updateWorkoutStats();
+    _renderWhoopDashboard();
+    _renderWhoopTodayActivities();
+  }, err => console.error('[activity] Workouts sync error:', err));
+
+  // 3. Edzésrutinok
+  const qRoutines = query(collection(db, 'users', effUid, 'routines'), orderBy('createdAt', 'desc'));
+  _unsubRoutines = onSnapshot(qRoutines, snap => {
+    const remoteDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const remoteIds = new Set(remoteDocs.map(d => d.id));
+    const localOnly = _allRoutines.filter(r => r.id && !remoteIds.has(r.id) && String(r.id).startsWith('rt_'));
+    _allRoutines = [...remoteDocs, ...localOnly];
+    _saveRoutinesToLocal(effUid);
+    _renderRoutinesList();
+    _renderUnifiedProgramsList();
+  }, err => console.error('[activity] Routines sync error:', err));
+
+  // 4. Egyéni gyakorlatok
+  const qExercises = query(collection(db, 'users', effUid, 'exercises'), orderBy('createdAt', 'desc'));
+  _unsubExercises = onSnapshot(qExercises, snap => {
+    const remoteDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const remoteIds = new Set(remoteDocs.map(d => d.id));
+    const localOnly = _allExercises.filter(ex => ex.id && !remoteIds.has(ex.id) && String(ex.id).startsWith('ex_'));
+    _allExercises = [...remoteDocs, ...localOnly];
+    _saveExercisesToLocal(effUid);
+    _renderExercisesList();
+    _renderUnifiedExercisesList();
+  }, err => console.error('[activity] Exercises sync error:', err));
+
+  // 5. Felszerelések (Gear)
+  const qGears = query(collection(db, 'users', effUid, 'gear'), orderBy('createdAt', 'desc'));
+  _unsubGears = onSnapshot(qGears, snap => {
+    _allGears = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    _renderGearShelf();
+    _populateGearSelects();
+  }, err => console.error('[activity] Gear sync error:', err));
+
+  // 6. Alvásnapló
+  const qSleep = query(collection(db, 'users', effUid, 'sleepLogs'), orderBy('createdAt', 'desc'));
+  _unsubSleep = onSnapshot(qSleep, snap => {
+    _allSleepLogs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    _renderSleepList();
+    _updateSleepStats();
+    _renderWhoopDashboard();
+  }, err => console.error('[activity] Sleep sync error:', err));
+
+  // 7. Regenerációs protokollok
+  const qProtocols = query(collection(db, 'users', effUid, 'recoveryProtocols'), orderBy('createdAt', 'desc'));
+  _unsubProtocols = onSnapshot(qProtocols, snap => {
+    const remoteDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const remoteIds = new Set(remoteDocs.map(d => d.id));
+    const localOnly = _allProtocols.filter(p => p.id && !remoteIds.has(p.id) && String(p.id).startsWith('proto_'));
+    _allProtocols = [...remoteDocs, ...localOnly];
+    _saveProtocolsToLocal(effUid);
+    _renderProtocolsList();
+    _renderUnifiedProgramsList();
+    _renderWhoopTodayActivities();
+  }, err => console.error('[activity] Recovery protocols sync error:', err));
+
+  // 8. Egyéni alkategóriák (Custom Subcategories)
+  const qSubcats = query(collection(db, 'users', effUid, 'customSubcategories'), orderBy('createdAt', 'asc'));
+  _unsubSubcategories = onSnapshot(qSubcats, snap => {
+    const remoteDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const remoteIds = new Set(remoteDocs.map(d => d.id));
+    const localOnly = _customSubcategories.filter(s => s.id && !remoteIds.has(s.id) && String(s.id).startsWith('sub_'));
+    _customSubcategories = [...remoteDocs, ...localOnly];
+    _saveSubcatsToLocal(effUid);
+    _renderUnifiedSubcategoriesBar();
+    _updateSubcategoryDatalists();
+  }, err => console.error('[activity] Subcategories sync error:', err));
+}
+
+// ── WHOOP 4.0 Számítások & Adatelőkészítés ─────────────────
+function _getWhoopDataForDate(dateStr) {
+  const manual = _allWhoopLogs[dateStr];
+  const dayWorkouts = _allWorkouts.filter(w => w.date === dateStr);
+  const daySleep = _allSleepLogs.find(s => s.date === dateStr);
+
+  // Terhelés (Strain) számítás a nap edzéseiből, ha nincs kézzel megadva
+  const totalWorkoutMins = dayWorkouts.reduce((s, w) => s + (Number(w.duration) || 0), 0);
+  const totalCalories = dayWorkouts.reduce((s, w) => s + (Number(w.calories) || (Number(w.duration) || 0) * 8.5), 0);
+
+  // WHOOP Strain logaritmikus formula: 21 * (1 - e^(-mins * 0.018))
+  let estimatedStrain = 0.0;
+  if (totalWorkoutMins > 0) {
+    estimatedStrain = Math.min(20.5, Math.round(21 * (1 - Math.exp(-totalWorkoutMins * 0.016)) * 10) / 10);
+    if (estimatedStrain < 4.0) estimatedStrain = 4.0;
+  }
+
+  // Alvásidő percekben
+  let actualSleepMinutes = 462; // Alapértelmezett: 7ó 42p
+  if (daySleep && daySleep.durationHours) {
+    actualSleepMinutes = Math.round(Number(daySleep.durationHours) * 60);
+  }
+
+  if (manual) {
+    return {
+      recovery: Number(manual.recovery) || 78,
+      hrv: Number(manual.hrv) || 78,
+      rhr: Number(manual.rhr) || 48,
+      strain: manual.strain !== undefined ? Number(manual.strain) : (estimatedStrain || 0.0),
+      activeKcal: manual.activeKcal !== undefined ? Number(manual.activeKcal) : Math.round(totalCalories),
+      avgHr: Number(manual.avgHr) || 136,
+      maxHr: Number(manual.maxHr) || 174,
+      workoutMins: totalWorkoutMins,
+      sleepActualMin: Number(manual.sleepActualMin) || actualSleepMinutes,
+      sleepNeedMin: Number(manual.sleepNeedMin) || 495, // 8ó 15p
+      sleepDebtMin: manual.sleepDebtMin !== undefined ? Number(manual.sleepDebtMin) : 33,
+      sleepEfficiency: Number(manual.sleepEfficiency) || 94,
+      stages: (manual.stages && (manual.stages.deepMin !== undefined || manual.stages.remMin !== undefined) && !(Number(manual.sleepActualMin) > 120 && (Number(manual.stages.deepMin || 0) + Number(manual.stages.remMin || 0) + Number(manual.stages.lightMin || 0)) < 30)) ? {
+        deepMin: Number(manual.stages.deepMin) || 0,
+        remMin: Number(manual.stages.remMin) || 0,
+        lightMin: Number(manual.stages.lightMin) || 0,
+        awakeMin: Number(manual.stages.awakeMin) || 0
+      } : extractGarminSleepStages(manual, Number(manual.sleepActualMin) || actualSleepMinutes, Number(manual.sleepScore) || Number(manual.sleepEfficiency) || 94, dateStr),
+      health: {
+        rhr: Number(manual.health?.rhr) || Number(manual.rhr) || 48,
+        hrv: Number(manual.health?.hrv) || Number(manual.hrv) || 78,
+        skinTemp: (manual.health?.skinTemp !== undefined && manual.health?.skinTemp !== null)
+          ? Number(manual.health.skinTemp)
+          : ((manual.health?.skin_temp_delta !== undefined && manual.health?.skin_temp_delta !== null)
+            ? Number(manual.health.skin_temp_delta)
+            : ((manual.skin_temp_delta !== undefined && manual.skin_temp_delta !== null)
+              ? Number(manual.skin_temp_delta)
+              : (manual.skinTemp !== undefined ? Number(manual.skinTemp) : -0.2))),
+        spo2: Number(manual.health?.spo2 ?? manual.health?.average_spo2 ?? manual.average_spo2 ?? manual.spo2 ?? 98),
+        respRate: Number(manual.health?.respRate ?? manual.health?.average_respiration ?? manual.average_respiration ?? manual.respRate ?? 14.8)
+      },
+      journal: {
+        caffeine: Boolean(manual.journal?.caffeine),
+        alcohol: Boolean(manual.journal?.alcohol),
+        sauna: Boolean(manual.journal?.sauna),
+        hydration: Boolean(manual.journal?.hydration),
+        stretch: Boolean(manual.journal?.stretch),
+        supplement: Boolean(manual.journal?.supplement)
+      },
+      isManual: true
+    };
+  }
+
+  // Okos becslés a naphoz
+  return {
+    recovery: 84,
+    hrv: 78,
+    rhr: 48,
+    strain: estimatedStrain || 14.2,
+    activeKcal: Math.round(totalCalories) || 720,
+    avgHr: 136,
+    maxHr: 174,
+    workoutMins: totalWorkoutMins || 75,
+    sleepActualMin: actualSleepMinutes,
+    sleepNeedMin: 495,
+    sleepDebtMin: 33,
+    sleepEfficiency: 94,
+    stages: extractGarminSleepStages(null, actualSleepMinutes, 94, dateStr),
+    health: {
+      rhr: 48,
+      hrv: 78,
+      skinTemp: -0.2,
+      spo2: 98,
+      respRate: 14.8
+    },
+    journal: {
+      caffeine: false,
+      alcohol: false,
+      sauna: false,
+      hydration: false,
+      stretch: false,
+      supplement: false
+    },
+    isManual: false
+  };
+}
+
+// ── WHOOP 4.0 Műszerfal Renderelése ─────────────────────────
+function _renderWhoopDashboard() {
+  const container = $('activity-whoop-container');
+  if (!container) return;
+
+  const data = _getWhoopDataForDate(_selectedDate);
+  const rec = Math.max(0, Math.min(100, Math.round(data.recovery)));
+
+  // Színkód meghatározása
+  // Zöld: 66-100%, Sárga: 33-65%, Piros: 0-32%
+  let color = '#00E676';
+  let badgeText = 'OPTIMÁLIS ÁLLAPOT';
+  let badgeBg = 'bg-emerald-500/10 text-[#00E676] border-emerald-500/30';
+  let glowColor = 'rgba(0, 230, 118, 0.4)';
+  let coachingText = 'A szervezeted kiválóan regenerálódott, készen áll a magas intenzitású edzésre és maximális terhelésre.';
+  let targetStrainRange = '14.0 – 17.5';
+
+  if (rec < 33) {
+    color = '#FF3D00';
+    badgeText = 'ALACSONY REGENERÁCIÓ';
+    badgeBg = 'bg-red-500/10 text-[#FF3D00] border-red-500/30';
+    glowColor = 'rgba(255, 61, 0, 0.4)';
+    coachingText = 'Alacsony regenerációs szint. Priorizáld a regenerációt: könnyű stretching, séta és korai fekvés javasolt.';
+    targetStrainRange = '6.0 – 10.0';
+  } else if (rec < 66) {
+    color = '#FFD600';
+    badgeText = 'KÖZEPES REGENERÁCIÓ';
+    badgeBg = 'bg-amber-500/10 text-[#FFD600] border-amber-500/30';
+    glowColor = 'rgba(255, 214, 0, 0.4)';
+    coachingText = 'Kiegyensúlyozott állapot. Fenntartó vagy mérsékelt intenzitású edzésterhelés ajánlott.';
+    targetStrainRange = '10.5 – 14.0';
+  }
+
+  // SVG körív progress számítás
+  // Kerület = 2 * PI * r = 2 * 3.14159 * 44 = ~276.46
+  const circumference = 276.46;
+  const strokeOffset = circumference - (circumference * rec / 100);
+
+  // Alvás arány (Garmin Sleep Score prioritással)
+  const sleepRatio = (data.sleepScore !== null && data.sleepScore !== undefined && Number(data.sleepScore) > 0)
+    ? Math.min(100, Math.max(0, Math.round(Number(data.sleepScore))))
+    : Math.min(100, Math.round((data.sleepActualMin / data.sleepNeedMin) * 100));
+  const stagesTotal = data.stages.deepMin + data.stages.remMin + data.stages.lightMin + data.stages.awakeMin || 1;
+  const deepPct = Math.round((data.stages.deepMin / stagesTotal) * 100);
+  const remPct = Math.round((data.stages.remMin / stagesTotal) * 100);
+  const awakePct = (data.stages.awakeMin > 0) ? Math.max(1, Math.round((data.stages.awakeMin / stagesTotal) * 100)) : 0;
+  const lightPct = Math.max(0, 100 - (deepPct + remPct + awakePct));
+
+  // Strain % skála (0.0 - 21.0)
+  const strainPct = Math.min(100, Math.round((data.strain / 21.0) * 100));
+
+  container.innerHTML = `
+    <!-- 1. DÁTUMVÁLASZTÓ ÉS FEJLÉC -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-4 mb-4 shadow-sm">
+      <div class="flex items-center justify-between">
+        <button id="whoop-prev-day-btn" class="w-9 h-9 rounded-2xl bg-gray-100 dark:bg-[#1E1F24] text-gray-700 dark:text-gray-300 flex items-center justify-center hover:bg-cyan-500/10 hover:text-cyan-400 active:scale-95 transition-all">
+          <i class="fa-solid fa-chevron-left text-sm"></i>
+        </button>
+
+        <div class="text-center relative flex-1 cursor-pointer">
+          <p class="text-xs font-bold text-cyan-600 dark:text-[#00E5FF] tracking-wider uppercase">WHOOP 4.0 Biometria</p>
+          <h3 class="text-sm font-extrabold text-gray-900 dark:text-white tracking-tight">${formatDateHU(_selectedDate)}</h3>
+          <input id="whoop-date-picker" type="date" value="${_selectedDate}" class="absolute inset-0 opacity-0 cursor-pointer w-full" />
+        </div>
+
+        <button id="whoop-next-day-btn" class="w-9 h-9 rounded-2xl bg-gray-100 dark:bg-[#1E1F24] text-gray-700 dark:text-gray-300 flex items-center justify-center hover:bg-cyan-500/10 hover:text-cyan-400 active:scale-95 transition-all">
+          <i class="fa-solid fa-chevron-right text-sm"></i>
+        </button>
+      </div>
+
+      <div class="mt-3 pt-3 border-t border-gray-100 dark:border-[#2A2C32] flex items-center justify-between text-xs">
+        <div class="flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full ${data.isManual ? 'bg-[#00E676] animate-pulse' : 'bg-cyan-400'}"></span>
+          <span class="text-[11px] text-gray-500 dark:text-gray-400 font-medium">
+            ${data.isManual ? 'Kézzel rögzített adatok' : 'Becsült biometria'}
+          </span>
+        </div>
+        <button id="whoop-open-entry-btn" class="px-3 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-[11px] shadow-sm active:scale-95 transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-sliders"></i>
+          <span>Adatok szerkesztése</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 2. DINAMIKUS COACHING BANNER -->
+    <div class="relative overflow-hidden rounded-3xl p-4 mb-4 border ${badgeBg} bg-white dark:bg-[#16171B] shadow-sm">
+      <div class="flex items-start gap-3">
+        <div class="w-9 h-9 rounded-2xl flex items-center justify-center flex-shrink-0" style="background: ${glowColor}; color: ${color};">
+          <i class="fa-solid fa-heart-pulse text-base"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-[10px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-md border" style="color: ${color}; border-color: ${color};">
+              ${badgeText}
+            </span>
+            <span class="text-[11px] text-gray-400 font-medium">Ajánlott Strain: ${targetStrainRange}</span>
+          </div>
+          <p class="text-xs font-semibold text-gray-800 dark:text-gray-200 leading-relaxed">${coachingText}</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. KÉT FŐ KÁRTYA GRIDBEN: RECOVERY & STRAIN -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+
+      <!-- A. RECOVERY KÁRTYA -->
+      <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 shadow-sm relative overflow-hidden flex flex-col justify-between">
+        <div class="flex items-center justify-between mb-3">
+          <div class="flex items-center gap-2">
+            <div class="w-2.5 h-2.5 rounded-full" style="background-color: ${color};"></div>
+            <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400 dark:text-gray-400">Recovery</h4>
+          </div>
+          <span class="text-[11px] font-bold" style="color: ${color};">${rec}%</span>
+        </div>
+
+        <!-- Körkörös Progress Indikátor -->
+        <div class="flex flex-col items-center justify-center my-3 relative">
+          <div class="relative w-36 h-36 flex items-center justify-center">
+            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+              <!-- Háttér körív -->
+              <circle cx="50" cy="50" r="44" stroke="currentColor" stroke-width="8" fill="transparent" class="text-gray-100 dark:text-[#2A2C32]" />
+              <!-- Aktív animált ív -->
+              <circle cx="50" cy="50" r="44" stroke="${color}" stroke-width="8" stroke-linecap="round" fill="transparent"
+                      stroke-dasharray="${circumference}" stroke-dashoffset="${strokeOffset}"
+                      style="transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1); filter: drop-shadow(0 0 6px ${glowColor});" />
+            </svg>
+            <div class="absolute inset-0 flex flex-col items-center justify-center text-center">
+              <span class="text-3xl font-black text-gray-900 dark:text-white tabular-nums leading-none tracking-tight">${rec}</span>
+              <span class="text-[10px] font-extrabold uppercase tracking-widest mt-0.5" style="color: ${color};">%</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Almutatók (HRV, RHR, Alvás) -->
+        <div class="grid grid-cols-3 gap-2 pt-3 border-t border-gray-100 dark:border-[#2A2C32] text-center">
+          <div>
+            <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">HRV</p>
+            <p class="text-sm font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${data.hrv} <span class="text-[9px] font-normal text-gray-400">ms</span></p>
+          </div>
+          <div class="border-x border-gray-100 dark:border-[#2A2C32]">
+            <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">RHR</p>
+            <p class="text-sm font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${data.rhr} <span class="text-[9px] font-normal text-gray-400">bpm</span></p>
+          </div>
+          <div>
+            <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Alvás</p>
+            <p class="text-sm font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${sleepRatio}%</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- B. DAY STRAIN KÁRTYA -->
+      <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 shadow-sm relative overflow-hidden flex flex-col justify-between">
+        <div class="flex items-center justify-between mb-3">
+          <div class="flex items-center gap-2">
+            <div class="w-2.5 h-2.5 rounded-full bg-[#00E5FF]"></div>
+            <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400 dark:text-gray-400">Day Strain</h4>
+          </div>
+          <span class="text-[11px] font-bold text-[#00E5FF]">${data.strain} / 21.0</span>
+        </div>
+
+        <!-- Terhelési Vízszintes Skála -->
+        <div class="my-4">
+          <div class="flex items-baseline justify-between mb-2">
+            <span class="text-3xl font-black text-gray-900 dark:text-white tabular-nums leading-none tracking-tight">${data.strain}</span>
+            <span class="text-xs font-bold text-[#00E5FF]">Cél: ${targetStrainRange}</span>
+          </div>
+
+          <!-- Progress Bar és Célzóna -->
+          <div class="relative w-full h-3 bg-gray-100 dark:bg-[#1E1F24] rounded-full overflow-hidden p-0.5 border border-gray-200 dark:border-[#2A2C32]">
+            <div class="h-full rounded-full bg-gradient-to-r from-cyan-400 to-[#00E5FF] transition-all duration-700" style="width: ${strainPct}%; box-shadow: 0 0 8px rgba(0, 229, 255, 0.5);"></div>
+          </div>
+          <div class="flex justify-between text-[9px] text-gray-400 mt-1 font-mono">
+            <span>0.0</span>
+            <span>7.0</span>
+            <span>14.0</span>
+            <span>21.0</span>
+          </div>
+        </div>
+
+        <!-- Almutatók (Kcal, Avg HR, Max HR, Idő) -->
+        <div class="grid grid-cols-4 gap-1 pt-3 border-t border-gray-100 dark:border-[#2A2C32] text-center">
+          <div>
+            <p class="text-[9px] font-bold text-gray-400 uppercase">Aktív kcal</p>
+            <p class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${data.activeKcal}</p>
+          </div>
+          <div>
+            <p class="text-[9px] font-bold text-gray-400 uppercase">Átlag HR</p>
+            <p class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${data.avgHr}</p>
+          </div>
+          <div>
+            <p class="text-[9px] font-bold text-gray-400 uppercase">Csúcs HR</p>
+            <p class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${data.maxHr}</p>
+          </div>
+          <div>
+            <p class="text-[9px] font-bold text-gray-400 uppercase">Edzésidő</p>
+            <p class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums mt-0.5">${formatMinutesToHours(data.workoutMins)}</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 4. ALVÁS ANALITIKA KÁRTYA (STACKED BAR DIAGRAMMAL) -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-moon text-indigo-500 text-sm"></i>
+          <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400">Sleep Performance</h4>
+        </div>
+        <div class="text-right">
+          <span class="text-sm font-extrabold text-indigo-500">${formatMinutesToHours(data.sleepActualMin)}</span>
+          <span class="text-xs text-gray-400 font-medium"> / ${formatMinutesToHours(data.sleepNeedMin)} (${sleepRatio}%)</span>
+        </div>
+      </div>
+
+      <!-- Alvásszakaszok Vízszintes Halmozott Sávja -->
+      <div class="w-full h-4 rounded-xl overflow-hidden flex gap-0.5 mb-3 bg-gray-100 dark:bg-[#1E1F24] p-0.5 border border-gray-200 dark:border-[#2A2C32]">
+        <div style="width: ${deepPct}%;" class="bg-[#1e40af] rounded-l-lg" title="Mélyalvás: ${deepPct}%"></div>
+        <div style="width: ${remPct}%;" class="bg-[#00E5FF]" title="REM: ${remPct}%"></div>
+        <div style="width: ${lightPct}%;" class="bg-[#64748b]" title="Könnyű alvás: ${lightPct}%"></div>
+        <div style="width: ${awakePct}%;" class="bg-[#f43f5e] rounded-r-lg" title="Ébren: ${awakePct}%"></div>
+      </div>
+
+      <!-- Szakaszok Jelmagyarázata -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs mb-4">
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-gray-50 dark:bg-[#1E1F24]">
+          <span class="w-2.5 h-2.5 rounded-full bg-[#1e40af]"></span>
+          <div>
+            <p class="text-[10px] text-gray-400 font-semibold">Mély (SWS)</p>
+            <p class="text-xs font-extrabold text-gray-800 dark:text-gray-100">${formatMinutesToHours(data.stages.deepMin)} (${deepPct}%)</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-gray-50 dark:bg-[#1E1F24]">
+          <span class="w-2.5 h-2.5 rounded-full bg-[#00E5FF]"></span>
+          <div>
+            <p class="text-[10px] text-gray-400 font-semibold">REM</p>
+            <p class="text-xs font-extrabold text-gray-800 dark:text-gray-100">${formatMinutesToHours(data.stages.remMin)} (${remPct}%)</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-gray-50 dark:bg-[#1E1F24]">
+          <span class="w-2.5 h-2.5 rounded-full bg-[#64748b]"></span>
+          <div>
+            <p class="text-[10px] text-gray-400 font-semibold">Könnyű</p>
+            <p class="text-xs font-extrabold text-gray-800 dark:text-gray-100">${formatMinutesToHours(data.stages.lightMin)} (${lightPct}%)</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-gray-50 dark:bg-[#1E1F24]">
+          <span class="w-2.5 h-2.5 rounded-full bg-[#f43f5e]"></span>
+          <div>
+            <p class="text-[10px] text-gray-400 font-semibold">Ébren</p>
+            <p class="text-xs font-extrabold text-gray-800 dark:text-gray-100">${formatMinutesToHours(data.stages.awakeMin)} (${awakePct}%)</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Alvási Adósság és Hatékonyság -->
+      <div class="grid grid-cols-2 gap-3 pt-3 border-t border-gray-100 dark:border-[#2A2C32] text-xs">
+        <div class="flex items-center justify-between">
+          <span class="text-gray-400 font-medium">Alvási adósság:</span>
+          <span class="font-extrabold text-amber-500">${data.sleepDebtMin} perc</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-gray-400 font-medium">Alvási hatékonyság:</span>
+          <span class="font-extrabold text-emerald-500">${data.sleepEfficiency}%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. HEALTH MONITOR (EGÉSZSÉGFIGYELŐ MÁTRIX) -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-shield-heart text-emerald-500 text-sm"></i>
+          <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400">Health Monitor (Baseline Mátrix)</h4>
+        </div>
+        <span class="text-[10px] font-bold text-emerald-500 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">Minden mutató rendben ✓</span>
+      </div>
+
+      <div class="space-y-2.5">
+        <!-- 1. Nyugalmi Pulzus -->
+        <div class="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 dark:bg-[#1E1F24]">
+          <div class="flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-xl bg-red-500/10 text-red-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-heart"></i>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-gray-800 dark:text-gray-200">Nyugalmi pulzus (RHR)</p>
+              <p class="text-[10px] text-gray-400">Tipikus sávod: 46–52 bpm</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums">${data.health.rhr} bpm</span>
+            <span class="text-emerald-500 text-xs"><i class="fa-solid fa-circle-check"></i></span>
+          </div>
+        </div>
+
+        <!-- 2. Pulzusvariabilitás -->
+        <div class="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 dark:bg-[#1E1F24]">
+          <div class="flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-wave-square"></i>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-gray-800 dark:text-gray-200">HRV (Pulzusvariabilitás)</p>
+              <p class="text-[10px] text-gray-400">Tipikus sávod: 70–85 ms</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums">${data.health.hrv} ms</span>
+            <span class="text-emerald-500 text-xs"><i class="fa-solid fa-circle-check"></i></span>
+          </div>
+        </div>
+
+        <!-- 3. Bőrhőmérséklet eltérés -->
+        <div class="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 dark:bg-[#1E1F24]">
+          <div class="flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-xl bg-amber-500/10 text-amber-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-temperature-half"></i>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-gray-800 dark:text-gray-200">Bőrhőmérséklet eltérés</p>
+              <p class="text-[10px] text-gray-400">Normál sáv: ±0.5 °C</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums">${data.health.skinTemp > 0 ? '+' : ''}${data.health.skinTemp} °C</span>
+            <span class="text-emerald-500 text-xs"><i class="fa-solid fa-circle-check"></i></span>
+          </div>
+        </div>
+
+        <!-- 4. Véroxigénszint -->
+        <div class="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 dark:bg-[#1E1F24]">
+          <div class="flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-xl bg-cyan-500/10 text-cyan-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-droplet"></i>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-gray-800 dark:text-gray-200">Véroxigénszint (SpO₂)</p>
+              <p class="text-[10px] text-gray-400">Normál sáv: 95–100%</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums">${data.health.spo2}%</span>
+            <span class="text-emerald-500 text-xs"><i class="fa-solid fa-circle-check"></i></span>
+          </div>
+        </div>
+
+        <!-- 5. Légzésszám -->
+        <div class="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 dark:bg-[#1E1F24]">
+          <div class="flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-xl bg-violet-500/10 text-violet-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-wind"></i>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-gray-800 dark:text-gray-200">Légzésszám</p>
+              <p class="text-[10px] text-gray-400">Normál sáv: 14.0–16.5 rpm</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-extrabold text-gray-900 dark:text-white tabular-nums">${data.health.respRate} /perc</span>
+            <span class="text-emerald-500 text-xs"><i class="fa-solid fa-circle-check"></i></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. NAPI NAPLÓ (JOURNAL QUICK-ENTRY) -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-book-bookmark text-amber-500 text-sm"></i>
+          <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400">WHOOP Journal (Napi szokások)</h4>
+        </div>
+        <span class="text-[10px] text-gray-400">Koppints a rögzítéshez</span>
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.caffeine ? 'bg-amber-500/10 border-amber-500/40 text-amber-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="caffeine">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">☕</span>
+            <i class="fa-solid ${data.journal.caffeine ? 'fa-circle-check text-amber-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">Koffein 14:00 után</p>
+        </button>
+
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.alcohol ? 'bg-red-500/10 border-red-500/40 text-red-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="alcohol">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">🍷</span>
+            <i class="fa-solid ${data.journal.alcohol ? 'fa-circle-check text-red-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">Alkohol fogyasztás</p>
+        </button>
+
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.sauna ? 'bg-orange-500/10 border-orange-500/40 text-orange-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="sauna">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">🧖</span>
+            <i class="fa-solid ${data.journal.sauna ? 'fa-circle-check text-orange-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">Szauna / Hidegfürdő</p>
+        </button>
+
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.hydration ? 'bg-sky-500/10 border-sky-500/40 text-sky-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="hydration">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">💧</span>
+            <i class="fa-solid ${data.journal.hydration ? 'fa-circle-check text-sky-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">3L+ Hidratáció</p>
+        </button>
+
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.stretch ? 'bg-violet-500/10 border-violet-500/40 text-violet-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="stretch">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">🧘</span>
+            <i class="fa-solid ${data.journal.stretch ? 'fa-circle-check text-violet-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">Nyújtás / SMR henger</p>
+        </button>
+
+        <button class="whoop-journal-btn p-3 rounded-2xl border text-left transition-all ${data.journal.supplement ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-500' : 'bg-gray-50 dark:bg-[#1E1F24] border-gray-200 dark:border-[#2A2C32] text-gray-600 dark:text-gray-400'}" data-habit="supplement">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-lg">💊</span>
+            <i class="fa-solid ${data.journal.supplement ? 'fa-circle-check text-emerald-500' : 'fa-circle text-gray-300 dark:text-gray-600'} text-xs"></i>
+          </div>
+          <p class="text-xs font-bold">Táplálékkiegészítő</p>
+        </button>
+      </div>
+    </div>
+
+    <!-- 7. TRENDVONALAK GRAFIKON (7 NAPOS / 30 NAPOS) -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 mb-4 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-chart-line text-[#00E5FF] text-sm"></i>
+          <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400">Biometrikus Trendek</h4>
+        </div>
+        <div class="flex items-center gap-1 bg-gray-100 dark:bg-[#1E1F24] p-1 rounded-xl">
+          <button id="whoop-trend-7d-btn" class="px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all ${_trendDays === 7 ? 'bg-cyan-600 text-white shadow-sm' : 'text-gray-500 hover:text-gray-800 dark:text-gray-400'}">7 nap</button>
+          <button id="whoop-trend-30d-btn" class="px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all ${_trendDays === 30 ? 'bg-cyan-600 text-white shadow-sm' : 'text-gray-500 hover:text-gray-800 dark:text-gray-400'}">30 nap</button>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-center gap-4 text-[10px] font-bold text-gray-400 mb-2">
+        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-[#00E676]"></span> Recovery %</span>
+        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-[#00E5FF]"></span> Strain</span>
+        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-violet-400"></span> HRV</span>
+      </div>
+
+      <div id="whoop-trend-chart-container" class="w-full h-44 flex items-center justify-center">
+        <!-- SVG Trend Chart dinamikusan generálva -->
+      </div>
+    </div>
+
+    <!-- 8. A NAP EDZÉSEI ÉS REGENERÁCIÓJA GYORSNÉZET -->
+    <div class="bg-white dark:bg-[#16171B] border border-gray-200 dark:border-[#2A2C32] rounded-3xl p-5 mb-8 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <h4 class="text-xs font-extrabold tracking-widest uppercase text-gray-400">Mai Edzések &amp; Szeánszok</h4>
+        <div class="flex items-center gap-1.5">
+          <button id="whoop-quick-add-wo-btn" class="px-2.5 py-1 rounded-xl bg-indigo-600 text-white text-[10px] font-bold active:scale-95 transition-all">
+            + Edzés
+          </button>
+          <button id="whoop-quick-add-rec-btn" class="px-2.5 py-1 rounded-xl bg-violet-600 text-white text-[10px] font-bold active:scale-95 transition-all">
+            + Regeneráció
+          </button>
+        </div>
+      </div>
+      <div id="whoop-today-activities-list" class="space-y-2">
+        <!-- Dinamikusan renderelt napi edzések és regenerációs programok -->
+      </div>
+    </div>
+  `;
+
+  _bindWhoopDashboardEvents();
+  _renderTrendChart();
+  _renderWhoopTodayActivities();
+}
+
+// ── WHOOP Műszerfal Eseménykezelők ─────────────────────────
+function _bindWhoopDashboardEvents() {
+  const prevBtn = $('whoop-prev-day-btn');
+  const nextBtn = $('whoop-next-day-btn');
+  const datePicker = $('whoop-date-picker');
+  const editBtn = $('whoop-open-entry-btn');
+
+  if (prevBtn) {
+    prevBtn.addEventListener('click', () => {
+      const d = new Date(_selectedDate + 'T12:00:00');
+      d.setDate(d.getDate() - 1);
+      _selectedDate = d.toISOString().slice(0, 10);
+      _renderWhoopDashboard();
+    });
+  }
+
+  if (nextBtn) {
+    nextBtn.addEventListener('click', () => {
+      const d = new Date(_selectedDate + 'T12:00:00');
+      d.setDate(d.getDate() + 1);
+      _selectedDate = d.toISOString().slice(0, 10);
+      _renderWhoopDashboard();
+    });
+  }
+
+  if (datePicker) {
+    datePicker.addEventListener('change', (e) => {
+      if (e.target.value) {
+        _selectedDate = e.target.value;
+        _renderWhoopDashboard();
+      }
+    });
+  }
+
+  if (editBtn) {
+    editBtn.addEventListener('click', _openWhoopEntryModal);
+  }
+
+  // Journal gombok
+  document.querySelectorAll('.whoop-journal-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const habit = btn.dataset.habit;
+      if (!habit || !_uid) return;
+      const current = _getWhoopDataForDate(_selectedDate);
+      const nextVal = !current.journal[habit];
+      try {
+        await setDoc(doc(db, 'users', _uid, 'whoopLogs', _selectedDate), {
+          journal: {
+            ...current.journal,
+            [habit]: nextVal
+          },
+          updatedAt: serverTimestamp()
+        }, { merge: true });
+      } catch (err) {
+        console.error('[activity] Journal save error:', err);
+      }
+    });
+  });
+
+  // Trend gombok
+  const btn7d = $('whoop-trend-7d-btn');
+  const btn30d = $('whoop-trend-30d-btn');
+  if (btn7d) {
+    btn7d.addEventListener('click', () => {
+      _trendDays = 7;
+      _renderWhoopDashboard();
+    });
+  }
+  if (btn30d) {
+    btn30d.addEventListener('click', () => {
+      _trendDays = 30;
+      _renderWhoopDashboard();
+    });
+  }
+
+  // Gyors hozzáadás gombok
+  const addWoBtn = $('whoop-quick-add-wo-btn');
+  const addRecBtn = $('whoop-quick-add-rec-btn');
+  if (addWoBtn) addWoBtn.addEventListener('click', _openWorkoutModal);
+  if (addRecBtn) addRecBtn.addEventListener('click', _openProtocolsModal);
+}
+
+// ── WHOOP Trend Grafikon (Smooth SVG Line Chart) ────────────
+function _renderTrendChart() {
+  const chartBox = $('whoop-trend-chart-container');
+  if (!chartBox) return;
+
+  const daysCount = _trendDays || 7;
+  const dates = [];
+  const base = new Date(_selectedDate + 'T12:00:00');
+
+  for (let i = daysCount - 1; i >= 0; i--) {
+    const d = new Date(base);
+    d.setDate(base.getDate() - i);
+    dates.push(d.toISOString().slice(0, 10));
+  }
+
+  const recPoints = [];
+  const strainPoints = [];
+  const hrvPoints = [];
+
+  dates.forEach(d => {
+    const entry = _getWhoopDataForDate(d);
+    recPoints.push(entry.recovery);
+    strainPoints.push(entry.strain);
+    hrvPoints.push(entry.hrv);
+  });
+
+  const width = 340;
+  const height = 150;
+  const padX = 25;
+  const padY = 20;
+  const plotW = width - padX * 2;
+  const plotH = height - padY * 2;
+
+  const stepX = dates.length > 1 ? plotW / (dates.length - 1) : plotW;
+
+  // Koordináta számítók
+  // Recovery: 0 - 100%
+  const getRecY = val => padY + plotH - (Math.max(0, Math.min(100, val)) / 100) * plotH;
+  // Strain: 0 - 21
+  const getStrainY = val => padY + plotH - (Math.max(0, Math.min(21, val)) / 21) * plotH;
+  // HRV: 30 - 120 ms
+  const getHrvY = val => padY + plotH - ((Math.max(30, Math.min(120, val)) - 30) / 90) * plotH;
+
+  const recCoords = recPoints.map((val, i) => ({ x: padX + i * stepX, y: getRecY(val) }));
+  const strainCoords = strainPoints.map((val, i) => ({ x: padX + i * stepX, y: getStrainY(val) }));
+  const hrvCoords = hrvPoints.map((val, i) => ({ x: padX + i * stepX, y: getHrvY(val) }));
+
+  function buildPath(pts) {
+    if (pts.length === 0) return '';
+    return pts.reduce((acc, pt, i) => {
+      if (i === 0) return `M ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
+      return `${acc} L ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`;
+    }, '');
+  }
+
+  const svg = `
+    <svg viewBox="0 0 ${width} ${height}" class="w-full h-full overflow-visible">
+      <defs>
+        <linearGradient id="recGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#00E676" stop-opacity="0.25" />
+          <stop offset="100%" stop-color="#00E676" stop-opacity="0.0" />
+        </linearGradient>
+      </defs>
+
+      <!-- Rács vonalak -->
+      <line x1="${padX}" y1="${padY}" x2="${width - padX}" y2="${padY}" stroke="#2A2C32" stroke-width="0.75" stroke-dasharray="3,3" />
+      <line x1="${padX}" y1="${padY + plotH / 2}" x2="${width - padX}" y2="${padY + plotH / 2}" stroke="#2A2C32" stroke-width="0.75" stroke-dasharray="3,3" />
+      <line x1="${padX}" y1="${padY + plotH}" x2="${width - padX}" y2="${padY + plotH}" stroke="#2A2C32" stroke-width="1" />
+
+      <!-- Vonalak -->
+      <path d="${buildPath(hrvCoords)}" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="${buildPath(strainCoords)}" fill="none" stroke="#00E5FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="${buildPath(recCoords)}" fill="none" stroke="#00E676" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+
+      <!-- Pontok -->
+      ${recCoords.map((pt, i) => `
+        <circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="3" fill="#00E676" class="cursor-pointer">
+          <title>${dates[i]}: ${recPoints[i]}% Recovery</title>
+        </circle>
+      `).join('')}
+
+      <!-- Dátum címkék -->
+      ${dates.map((d, i) => {
+        if (daysCount === 30 && i % 5 !== 0 && i !== dates.length - 1) return '';
+        const x = padX + i * stepX;
+        const dayLabel = d.slice(8);
+        return `<text x="${x.toFixed(1)}" y="${height - 4}" text-anchor="middle" font-size="9" fill="#9ca3af" font-weight="600">${dayLabel}</text>`;
+      }).join('')}
+    </svg>
+  `;
+
+  chartBox.innerHTML = svg;
+}
+
+// ── Mai Edzések és Regeneráció Gyorslista ───────────────────
+function _renderWhoopTodayActivities() {
+  const listEl = $('whoop-today-activities-list');
+  if (!listEl) return;
+
+  const dayWorkouts = _allWorkouts.filter(w => w.date === _selectedDate);
+  const dayProtocols = _allProtocols.filter(p => p.date === _selectedDate);
+
+  if (dayWorkouts.length === 0 && dayProtocols.length === 0) {
+    listEl.innerHTML = `
+      <p class="text-xs text-gray-400 italic text-center py-3">Még nem rögzítettél edzést vagy regenerációt erre a napra.</p>
+    `;
+    return;
+  }
+
+  let html = '';
+
+  dayWorkouts.forEach(w => {
+    const sport = getSportById(w.sportId || 'strength_training');
+    html += `
+      <div class="activity-today-wo-item cursor-pointer flex items-center justify-between p-3 rounded-2xl bg-gray-50 dark:bg-[#1E1F24] border border-gray-100 dark:border-[#2A2C32] hover:border-indigo-400 dark:hover:border-indigo-500 transition-colors" data-id="${w.id}">
+        <div class="flex items-center gap-3">
+          <div class="w-8 h-8 rounded-xl bg-indigo-500/10 text-indigo-500 flex items-center justify-center text-sm">
+            <i class="${sport.icon || 'fa-solid fa-dumbbell'}"></i>
+          </div>
+          <div>
+            <p class="text-xs font-bold text-gray-900 dark:text-white">${w.name || sport.name}</p>
+            <p class="text-[10px] text-gray-400 font-medium">${w.duration || 60} perc · ${w.calories ? `${w.calories} kcal` : sport.cat}</p>
+          </div>
+        </div>
+        <span class="text-[10px] font-extrabold text-[#00E5FF] bg-cyan-500/10 px-2 py-0.5 rounded-full border border-cyan-500/20">Edzés</span>
+      </div>
+    `;
+  });
+
+  dayProtocols.forEach(p => {
+    html += `
+      <div class="whoop-recovery-card-act cursor-pointer flex items-center justify-between p-3 rounded-2xl bg-gray-50 dark:bg-[#1E1F24] border border-gray-100 dark:border-[#2A2C32] hover:border-[#38BDF8] transition-colors" data-id="${p.id}">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="w-8 h-8 rounded-xl bg-sky-500/10 text-[#38BDF8] flex items-center justify-center text-sm flex-shrink-0">
+            <i class="fa-solid fa-spa"></i>
+          </div>
+          <div class="min-w-0">
+            <p class="text-xs font-bold text-gray-900 dark:text-white truncate">${p.name || 'Regenerációs szeánsz'}</p>
+            <p class="text-[10px] text-gray-400 font-medium">${p.duration || 20} perc · ${p.type || 'SMR / Nyújtás'}</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 flex-shrink-0">
+          <span class="text-[10px] font-extrabold text-[#38BDF8] bg-sky-500/10 px-2 py-0.5 rounded-full border border-sky-500/20">Recovery</span>
+          <button class="whoop-edit-rec-btn-act w-6 h-6 rounded-lg text-gray-400 hover:text-[#38BDF8] flex items-center justify-center transition-colors" data-id="${p.id}" title="Szerkesztés">
+            <i class="fa-solid fa-pen text-[10px] pointer-events-none"></i>
+          </button>
+          <button class="whoop-delete-rec-btn-act w-6 h-6 rounded-lg text-gray-400 hover:text-red-500 flex items-center justify-center transition-colors" data-id="${p.id}" title="Törlés">
+            <i class="fa-solid fa-trash text-[10px] pointer-events-none"></i>
+          </button>
+        </div>
+      </div>
+    `;
+  });
+
+  listEl.innerHTML = html;
+
+  listEl.querySelectorAll('.activity-today-wo-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const wid = el.dataset.id;
+      if (wid && typeof openWorkoutDetailModal === 'function') openWorkoutDetailModal(wid);
+    });
+  });
+
+  listEl.querySelectorAll('.whoop-recovery-card-act').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.whoop-delete-rec-btn-act') || e.target.closest('.whoop-edit-rec-btn-act')) return;
+      const id = card.dataset.id;
+      if (id && typeof window.openRecoveryEditModal === 'function') {
+        window.openRecoveryEditModal(id, 'recoveryProtocols');
+      }
+    });
+  });
+
+  listEl.querySelectorAll('.whoop-edit-rec-btn-act').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id && typeof window.openRecoveryEditModal === 'function') {
+        window.openRecoveryEditModal(id, 'recoveryProtocols');
+      }
+    });
+  });
+
+  listEl.querySelectorAll('.whoop-delete-rec-btn-act').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (!id || !_uid) return;
+      try {
+        if (typeof window.deleteRecoveryActivity === 'function') {
+          await window.deleteRecoveryActivity(id, 'recoveryProtocols');
+        } else {
+          await deleteDoc(doc(db, 'users', _uid, 'recoveryProtocols', id));
+        }
+        _allProtocols = _allProtocols.filter(p => p.id !== id);
+        _renderWhoopTodayActivities();
+      } catch (err) {
+        console.error('[activity] Error deleting recovery protocol:', err);
+      }
+    });
+  });
+}
+
+// ── WHOOP Adatbevitel Modál (Kézi rögzítés) ────────────────
+function _openWhoopEntryModal() {
+  const modal = $('whoop-entry-modal');
+  const sheet = $('whoop-entry-sheet');
+  if (!modal || !sheet) return;
+
+  const current = _getWhoopDataForDate(_selectedDate);
+
+  // Értékek beállítása
+  const recIn = $('whoop-input-recovery');
+  const hrvIn = $('whoop-input-hrv');
+  const rhrIn = $('whoop-input-rhr');
+  const strainIn = $('whoop-input-strain');
+  const sleepActIn = $('whoop-input-sleep-actual');
+  const sleepNeedIn = $('whoop-input-sleep-need');
+  const deepIn = $('whoop-input-deep');
+  const remIn = $('whoop-input-rem');
+  const lightIn = $('whoop-input-light');
+  const awakeIn = $('whoop-input-awake');
+  const skinIn = $('whoop-input-skin');
+  const spo2In = $('whoop-input-spo2');
+  const respIn = $('whoop-input-resp');
+  const dateText = $('whoop-entry-modal-date');
+
+  if (dateText) dateText.textContent = formatDateHU(_selectedDate);
+  if (recIn) recIn.value = current.recovery;
+  if (hrvIn) hrvIn.value = current.hrv;
+  if (rhrIn) rhrIn.value = current.rhr;
+  if (strainIn) strainIn.value = current.strain;
+  if (sleepActIn) sleepActIn.value = (current.sleepActualMin / 60).toFixed(1);
+  if (sleepNeedIn) sleepNeedIn.value = (current.sleepNeedMin / 60).toFixed(1);
+  if (deepIn) deepIn.value = current.stages.deepMin;
+  if (remIn) remIn.value = current.stages.remMin;
+  if (lightIn) lightIn.value = current.stages.lightMin;
+  if (awakeIn) awakeIn.value = current.stages.awakeMin;
+  if (skinIn) skinIn.value = current.health.skinTemp;
+  if (spo2In) spo2In.value = current.health.spo2;
+  if (respIn) respIn.value = current.health.respRate;
+
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+
+function _closeWhoopEntryModal() {
+  const modal = $('whoop-entry-modal');
+  const sheet = $('whoop-entry-sheet');
+  if (!modal || !sheet) return;
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => modal.classList.add('hidden'), 340);
+}
+
+async function _saveWhoopEntry() {
+  if (!_uid) return;
+
+  const recIn = $('whoop-input-recovery');
+  const hrvIn = $('whoop-input-hrv');
+  const rhrIn = $('whoop-input-rhr');
+  const strainIn = $('whoop-input-strain');
+  const sleepActIn = $('whoop-input-sleep-actual');
+  const sleepNeedIn = $('whoop-input-sleep-need');
+  const deepIn = $('whoop-input-deep');
+  const remIn = $('whoop-input-rem');
+  const lightIn = $('whoop-input-light');
+  const awakeIn = $('whoop-input-awake');
+  const skinIn = $('whoop-input-skin');
+  const spo2In = $('whoop-input-spo2');
+  const respIn = $('whoop-input-resp');
+  const saveBtn = $('whoop-save-entry-btn');
+
+  const recovery = Math.max(0, Math.min(100, parseInt(recIn?.value, 10) || 75));
+  const hrv = parseInt(hrvIn?.value, 10) || 75;
+  const rhr = parseInt(rhrIn?.value, 10) || 50;
+  const strain = Math.max(0, Math.min(21, parseFloat(strainIn?.value) || 12.0));
+  const sleepActHours = parseFloat(sleepActIn?.value) || 7.5;
+  const sleepNeedHours = parseFloat(sleepNeedIn?.value) || 8.0;
+
+  const actualMins = Math.round(sleepActHours * 60);
+  const needMins = Math.round(sleepNeedHours * 60);
+  const debtMins = Math.max(0, needMins - actualMins);
+  const efficiency = Math.min(100, Math.round((actualMins / needMins) * 100));
+
+  const fallbackStages = actualMins ? extractGarminSleepStages(null, actualMins, efficiency, _selectedDate) : null;
+  const deepMin = parseInt(deepIn?.value, 10) || (fallbackStages?.deepMin ?? Math.round(actualMins * 0.22));
+  const remMin = parseInt(remIn?.value, 10) || (fallbackStages?.remMin ?? Math.round(actualMins * 0.25));
+  const lightMin = parseInt(lightIn?.value, 10) || (fallbackStages?.lightMin ?? Math.round(actualMins * 0.47));
+  const awakeMin = parseInt(awakeIn?.value, 10) || (fallbackStages?.awakeMin ?? Math.round(actualMins * 0.06));
+
+  const skinTemp = parseFloat(skinIn?.value) || 0.0;
+  const spo2 = Math.min(100, parseInt(spo2In?.value, 10) || 98);
+  const respRate = parseFloat(respIn?.value) || 15.0;
+
+  const current = _getWhoopDataForDate(_selectedDate);
+
+  const payload = {
+    recovery,
+    hrv,
+    rhr,
+    strain,
+    sleepActualMin: actualMins,
+    sleepNeedMin: needMins,
+    sleepDebtMin: debtMins,
+    sleepEfficiency: efficiency,
+    stages: {
+      deepMin,
+      remMin,
+      lightMin,
+      awakeMin
+    },
+    health: {
+      rhr,
+      hrv,
+      skinTemp,
+      spo2,
+      respRate
+    },
+    journal: current.journal,
+    updatedAt: serverTimestamp()
+  };
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Mentés...';
+  }
+
+  try {
+    await setDoc(doc(db, 'users', _uid, 'whoopLogs', _selectedDate), payload, { merge: true });
+    _closeWhoopEntryModal();
+  } catch (err) {
+    console.error('[activity] Error saving whoop log:', err);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'WHOOP Adatok Mentése';
+    }
+  }
+}
+
+// ── FŐ ESEMÉNYKEZELŐK BEKÖTÉSE ─────────────────────────────
+function _bindUIEvents() {
+  // 1. Alfülek váltó gombjai
+  document.querySelectorAll('.activity-subtab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const subtab = btn.dataset.subtab || 'whoop';
+      _switchSubtab(subtab);
+    });
+  });
+
+  // 2. WHOOP Modál gombok
+  const whoopClose = $('whoop-entry-close');
+  const whoopBackdrop = $('whoop-entry-backdrop');
+  const whoopSave = $('whoop-save-entry-btn');
+
+  if (whoopClose) whoopClose.addEventListener('click', _closeWhoopEntryModal);
+  if (whoopBackdrop) whoopBackdrop.addEventListener('click', _closeWhoopEntryModal);
+  if (whoopSave) whoopSave.addEventListener('click', _saveWhoopEntry);
+
+  // 3. Edzésnapló események bekötése
+  _bindWorkoutModuleEvents();
+
+  // 4. Regeneráció események bekötése
+  _bindRecoveryModuleEvents();
+
+  // 5. Felszerelés (Gear) események bekötése
+  _bindGearEvents();
+
+  // 6. Összevont Edzéssablonok és Regenerációs Rutinok eseményei
+  _bindUnifiedTemplatesEvents();
+
+  // 7. Visszamenőleges eseménykezelők a rejtett gombokhoz
+  const rTabPrograms = $('routines-tab-programs');
+  const rTabExercises = $('routines-tab-exercises');
+  const rContentPrograms = $('routines-content-programs');
+  const rContentExercises = $('routines-content-exercises');
+
+  if (rTabPrograms && rTabExercises) {
+    rTabPrograms.addEventListener('click', () => {
+      if (rContentPrograms) rContentPrograms.classList.remove('hidden');
+      if (rContentExercises) rContentExercises.classList.add('hidden');
+      _renderRoutinesList();
+    });
+
+    rTabExercises.addEventListener('click', () => {
+      if (rContentExercises) rContentExercises.classList.remove('hidden');
+      if (rContentPrograms) rContentPrograms.classList.add('hidden');
+      _renderExercisesList();
+    });
+  }
+
+  const recTabPrograms = $('recovery-tab-programs');
+  const recTabExercises = $('recovery-tab-exercises');
+  const recContentPrograms = $('recovery-content-programs');
+  const recContentExercises = $('recovery-content-exercises');
+
+  if (recTabPrograms && recTabExercises) {
+    recTabPrograms.addEventListener('click', () => {
+      if (recContentPrograms) recContentPrograms.classList.remove('hidden');
+      if (recContentExercises) recContentExercises.classList.add('hidden');
+      _renderProtocolsList();
+    });
+
+    recTabExercises.addEventListener('click', () => {
+      if (recContentExercises) recContentExercises.classList.remove('hidden');
+      if (recContentPrograms) recContentPrograms.classList.add('hidden');
+      _renderRecoveryExercisesList();
+    });
+  }
+
+  const recNewExBtn = $('rec-open-exercise-btn');
+  if (recNewExBtn) {
+    recNewExBtn.addEventListener('click', () => {
+      _openExercisesModal();
+      const catIn = $('wo-ex-category-in') || $('wo-input-ex-category');
+      if (catIn) catIn.value = 'SMR';
+    });
+  }
+}
+
+function _switchSubtab(subtab) {
+  _activeSubtab = subtab;
+
+  // Header címke frissítése
+  const titleEl = $('activity-header-title');
+  if (titleEl) {
+    if (subtab === 'routines' || subtab === 'recovery') titleEl.textContent = 'Edzéssablonok és regenerációs rutinok';
+    else if (subtab === 'gear') titleEl.textContent = 'Felszerelések (Gear Tracker)';
+    else if (subtab === 'workouts') titleEl.textContent = 'Rögzített Edzések';
+    else titleEl.textContent = 'Aktivitás & Tréning';
+  }
+
+  // Gombok stílusa (ha az outer nav létezik)
+  document.querySelectorAll('.activity-subtab-btn').forEach(btn => {
+    const isAct = btn.dataset.subtab === subtab;
+    btn.className = `activity-subtab-btn flex-shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition-all ${
+      isAct
+        ? 'bg-white dark:bg-slate-900 text-cyan-600 dark:text-[#00E5FF] shadow-sm'
+        : 'text-gray-500 hover:text-gray-800 dark:text-gray-400'
+    }`;
+  });
+
+  // Nézetek elrejtése/megjelenítése
+  const views = [
+    { id: 'activity-view-whoop', key: 'whoop' },
+    { id: 'activity-view-workouts', key: 'workouts' },
+    { id: 'activity-view-routines', key: 'routines' },
+    { id: 'activity-view-recovery', key: 'recovery' },
+    { id: 'activity-view-gear', key: 'gear' }
+  ];
+
+  const targetKey = subtab === 'recovery' ? 'routines' : subtab;
+
+  views.forEach(v => {
+    const el = $(v.id);
+    if (!el) return;
+    if (v.key === targetKey) {
+      el.classList.remove('hidden');
+    } else {
+      el.classList.add('hidden');
+    }
+  });
+
+  if (subtab === 'whoop') {
+    _renderWhoopDashboard();
+  } else if (subtab === 'workouts') {
+    _renderWorkoutsList();
+    _updateWorkoutStats();
+  } else if (subtab === 'routines' || subtab === 'recovery') {
+    if (subtab === 'recovery') {
+      _templateActiveCategory = 'recovery';
+    }
+    _renderUnifiedTemplatesScreen();
+  } else if (subtab === 'gear') {
+    _renderGearShelf();
+  }
+}
+window.switchActivitySubtab = _switchSubtab;
+
+// ══════════════════════════════════════════════════════════════
+// EDZÉSNAPLÓ, GYAKORLATOK & RUTINOK (GARMIN SPORTÁGAKKAL)
+// ══════════════════════════════════════════════════════════════
+
+let _selectedSportId = 'strength_training';
+let _activeDatafields = [];
+
+function _bindWorkoutModuleEvents() {
+  const fab = $('wo-fab');
+  const closeBtn = $('wo-modal-close');
+  const backdrop = $('wo-modal-backdrop');
+  const saveBtn = $('wo-save-btn');
+  const sportSelect = $('wo-sport-select') || $('wo-select-sport');
+  const addDfBtn = $('wo-add-datafield-btn');
+
+  if (fab) fab.addEventListener('click', _openWorkoutModal);
+  if (closeBtn) closeBtn.addEventListener('click', _closeWorkoutModal);
+  if (backdrop) backdrop.addEventListener('click', _closeWorkoutModal);
+  if (saveBtn) saveBtn.addEventListener('click', _saveWorkout);
+
+  if (sportSelect) {
+    sportSelect.addEventListener('change', (e) => {
+      _selectedSportId = e.target.value;
+      _updateSportUI();
+      // Alapértelmezett felszerelések automatikus hozzárendelése az új sportághoz
+      _allGears.forEach(g => {
+        const defSports = Array.isArray(g.defaultSports) ? g.defaultSports : (g.defaultSport ? [g.defaultSport] : []);
+        if (defSports.includes(_selectedSportId)) {
+          _selectedWorkoutGearIds.add(g.id);
+        }
+      });
+      _renderSelectedWorkoutGears();
+    });
+  }
+
+  if (addDfBtn) addDfBtn.addEventListener('click', _addDatafieldRow);
+
+  // Edzésbe beszúrás választó modál (+ gomb az edzés rögzítésnél)
+  const insertExBtn = $('wo-insert-exercise-btn');
+  if (insertExBtn) {
+    insertExBtn.addEventListener('click', () => {
+      _activeExerciseTarget = 'workout';
+      _openExerciseOrRoutinePickerModal();
+    });
+  }
+
+  const pickerClose = $('wo-exercise-or-routine-picker-close');
+  const pickerBackdrop = $('wo-exercise-or-routine-picker-backdrop');
+  if (pickerClose) pickerClose.addEventListener('click', _closeExerciseOrRoutinePickerModal);
+  if (pickerBackdrop) pickerBackdrop.addEventListener('click', _closeExerciseOrRoutinePickerModal);
+
+  const pickSingleExBtn = $('wo-pick-single-ex-btn');
+  if (pickSingleExBtn) {
+    pickSingleExBtn.addEventListener('click', () => {
+      if (_activeExerciseTarget !== 'detail' && window._activeExerciseTarget !== 'detail') {
+        _activeExerciseTarget = 'workout';
+      }
+      _closeExerciseOrRoutinePickerModal();
+      _openExercisesModal();
+    });
+  }
+
+  const pickRoutineBtn = $('wo-pick-routine-btn');
+  if (pickRoutineBtn) {
+    pickRoutineBtn.addEventListener('click', () => {
+      _closeExerciseOrRoutinePickerModal();
+      _openRoutinesModal();
+    });
+  }
+
+  // Rutinok modál
+  const openRoutinesBtn = $('wo-open-routines-btn');
+  if (openRoutinesBtn) openRoutinesBtn.addEventListener('click', _openRoutinesModal);
+
+  const routineAddExBtn = $('wo-routine-add-ex-btn');
+  if (routineAddExBtn) {
+    routineAddExBtn.addEventListener('click', () => {
+      _activeExerciseTarget = 'routine';
+      _openExercisesModal();
+    });
+  }
+
+  const routinesClose = $('wo-routines-close') || $('wo-routines-modal-close');
+  const routinesBackdrop = $('wo-routines-backdrop') || $('wo-routines-modal-backdrop');
+  const saveRoutineBtn = $('wo-save-custom-routine-btn') || $('wo-save-routine-btn');
+  if (routinesClose) routinesClose.addEventListener('click', _closeRoutinesModal);
+  if (routinesBackdrop) routinesBackdrop.addEventListener('click', _closeRoutinesModal);
+  if (saveRoutineBtn) saveRoutineBtn.addEventListener('click', _saveRoutine);
+
+  // Gyakorlatok modál
+  const openExercisesBtn = $('wo-open-exercises-btn');
+  if (openExercisesBtn) openExercisesBtn.addEventListener('click', _openExercisesModal);
+
+  const exClose = $('wo-exercises-close') || $('wo-exercises-modal-close');
+  const exBackdrop = $('wo-exercises-backdrop') || $('wo-exercises-modal-backdrop');
+  const saveExBtn = $('wo-save-new-ex-btn') || $('wo-save-exercise-btn');
+  const cancelExBtn = $('wo-cancel-edit-ex-btn');
+  if (exClose) exClose.addEventListener('click', _closeExercisesModal);
+  if (exBackdrop) exBackdrop.addEventListener('click', _closeExercisesModal);
+  if (saveExBtn) saveExBtn.addEventListener('click', _saveCustomExercise);
+  if (cancelExBtn) cancelExBtn.addEventListener('click', _resetExerciseForm);
+
+  const exCatSelect = $('wo-new-ex-cat');
+  const exSubcatSelect = $('wo-new-ex-subcat');
+  if (exCatSelect) {
+    exCatSelect.addEventListener('change', () => {
+      _updateExerciseSubcatDropdown();
+    });
+  }
+  if (exSubcatSelect) {
+    exSubcatSelect.addEventListener('change', () => {
+      if (exSubcatSelect.value === '__new__') {
+        const customName = prompt('Add meg az új alkategória nevét:');
+        if (customName && customName.trim()) {
+          const cleanName = customName.trim();
+          const currentCat = exCatSelect?.value || 'Erőfejlesztő';
+          const catKey = _getCategoryKey(currentCat);
+          const effUid = _getEffectiveUid();
+
+          if (!_customSubcategories.some(s => s.name.toLowerCase() === cleanName.toLowerCase() && s.mainCategory === catKey)) {
+            const localSub = { id: 'sub_' + Date.now(), name: cleanName, mainCategory: catKey, createdAt: new Date().toISOString() };
+            _customSubcategories.push(localSub);
+            _saveSubcatsToLocal(effUid);
+            if (db && effUid && !effUid.startsWith('local_')) {
+              addDoc(collection(db, 'users', effUid, 'customSubcategories'), {
+                name: cleanName,
+                mainCategory: catKey,
+                createdAt: serverTimestamp()
+              }).then(ref => {
+                localSub.id = ref.id;
+                _saveSubcatsToLocal(effUid);
+              }).catch(err => console.warn('[activity] error saving subcat:', err));
+            }
+            _renderUnifiedSubcategoriesBar();
+            _updateSubcategoryDatalists();
+          }
+          _updateExerciseSubcatDropdown(cleanName);
+        } else {
+          exSubcatSelect.value = '';
+        }
+      }
+    });
+  }
+
+  const searchIn = $('wo-ex-search');
+  if (searchIn) {
+    searchIn.addEventListener('input', (e) => {
+      _exerciseSearchQuery = e.target.value;
+      _renderExercisesList();
+    });
+  }
+
+  document.querySelectorAll('.wo-ex-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.wo-ex-filter-btn').forEach(b => {
+        b.className = 'wo-ex-filter-btn flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold bg-gray-100 dark:bg-slate-800 text-gray-500 dark:text-gray-400';
+      });
+      btn.className = 'wo-ex-filter-btn flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold bg-indigo-600 text-white';
+      _activeExerciseCategory = btn.dataset.cat || 'all';
+      _renderExercisesList();
+    });
+  });
+
+  const toggleMultiBtn = $('wo-ex-toggle-multiselect-btn');
+  if (toggleMultiBtn) {
+    toggleMultiBtn.addEventListener('click', () => {
+      _isExerciseMultiSelectMode = !_isExerciseMultiSelectMode;
+      if (!_isExerciseMultiSelectMode) {
+        _selectedExercisesForBatch.clear();
+      }
+      _updateMultiSelectUI();
+      _renderExercisesList();
+    });
+  }
+
+  const cancelMultiBtn = $('wo-ex-cancel-multiselect-btn');
+  if (cancelMultiBtn) {
+    cancelMultiBtn.addEventListener('click', () => {
+      _isExerciseMultiSelectMode = false;
+      _selectedExercisesForBatch.clear();
+      _updateMultiSelectUI();
+      _renderExercisesList();
+    });
+  }
+
+  const addMultiBtn = $('wo-ex-add-multiselected-btn');
+  if (addMultiBtn) {
+    addMultiBtn.addEventListener('click', () => {
+      if (_selectedExercisesForBatch.size === 0) return;
+      const routineModal = $('wo-routines-modal');
+      const isRoutineOpen = routineModal && !routineModal.classList.contains('hidden');
+      const protoModal = $('rec-protocols-modal');
+      const isProtoOpen = protoModal && !protoModal.classList.contains('hidden');
+      const detailModal = $('wo-detail-modal');
+      const isDetailOpen = detailModal && !detailModal.classList.contains('hidden');
+
+      _selectedExercisesForBatch.forEach(item => {
+        _insertExerciseToActiveTarget(item.name, item.muscle, true);
+      });
+      _isExerciseMultiSelectMode = false;
+      _selectedExercisesForBatch.clear();
+      _updateMultiSelectUI();
+      _closeExercisesModal();
+
+      if (!isRoutineOpen && !isProtoOpen && !isDetailOpen && _activeExerciseTarget !== 'routine' && _activeExerciseTarget !== 'recovery' && _activeExerciseTarget !== 'detail') {
+        const woModal = $('wo-modal');
+        if (woModal && woModal.classList.contains('hidden')) {
+          _openWorkoutModal();
+        }
+      }
+      _activeExerciseTarget = null;
+      if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+    });
+  }
+
+  _populateSportDropdown();
+  _populateDatafieldDropdown();
+  _populateGearSelects();
+}
+
+function _populateSportDropdown() {
+  const select = $('wo-sport-select') || $('wo-select-sport');
+  const routineSportSelect = $('wo-new-routine-sport');
+  if (!select && !routineSportSelect) return;
+
+  const categories = {};
+  GARMIN_SPORTS.forEach(s => {
+    if (!categories[s.cat]) categories[s.cat] = [];
+    categories[s.cat].push(s);
+  });
+
+  const optionsHtml = Object.entries(categories).map(([cat, list]) => `
+    <optgroup label="${cat}">
+      ${list.map(s => `<option value="${s.id}" ${s.id === 'strength_training' ? 'selected' : ''}>${s.name}</option>`).join('')}
+    </optgroup>
+  `).join('');
+
+  if (select) select.innerHTML = optionsHtml;
+  if (routineSportSelect) routineSportSelect.innerHTML = optionsHtml;
+}
+
+function _openExerciseOrRoutinePickerModal() {
+  const modal = $('wo-exercise-or-routine-picker-modal');
+  const sheet = $('wo-exercise-or-routine-picker-sheet');
+  if (!modal || !sheet) return;
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+
+function _closeExerciseOrRoutinePickerModal() {
+  const modal = $('wo-exercise-or-routine-picker-modal');
+  const sheet = $('wo-exercise-or-routine-picker-sheet');
+  if (!modal || !sheet) return;
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => modal.classList.add('hidden'), 340);
+}
+
+function _populateDatafieldDropdown() {
+  const select = $('wo-select-datafield-picker');
+  if (!select) return;
+
+  const cats = {};
+  GARMIN_DATAFIELDS.forEach(df => {
+    const cat = df.cat || df.category || 'Egyéb';
+    if (!cats[cat]) cats[cat] = [];
+    cats[cat].push(df);
+  });
+
+  select.innerHTML = `
+    <option value="">+ Válassz hivatalos Garmin adatmezőt...</option>
+    ${Object.entries(cats).map(([cat, fields]) => `
+      <optgroup label="${cat}">
+        ${fields.map(f => `<option value="${f.id}">${f.name || f.label || f.id} (${f.unit || ''})</option>`).join('')}
+      </optgroup>
+    `).join('')}
+  `;
+}
+
+function _updateSportUI() {
+  const sport = getSportById(_selectedSportId);
+  const badge = $('wo-sport-badge-icon');
+  if (badge && sport) {
+    badge.className = `${sport.icon || 'fa-solid fa-dumbbell'} text-sm text-indigo-600 dark:text-indigo-400`;
+  }
+}
+
+function _createStructuredExerciseStrip(item = { name: '', muscle: 'chest', sets: 4, reps: 10, weight: '' }, theme = 'workout') {
+  const row = document.createElement('div');
+  const rawName = item.name || 'Gyakorlat';
+  const escName = rawName.replace(/"/g, '&quot;');
+  const muscleKey = item.muscle || 'chest';
+  const setsVal = item.sets !== undefined && item.sets !== null && item.sets !== '' ? item.sets : 4;
+  const repsVal = item.reps !== undefined && item.reps !== null && item.reps !== '' ? item.reps : 10;
+  const weightVal = item.weight !== undefined && item.weight !== null ? item.weight : '';
+
+  const isRec = theme === 'recovery' || /smr|nyújt|stretch|légzés|szauna/i.test((item.category || '') + ' ' + rawName);
+
+  // Állóképességi gyakorlat intelligens detektálása
+  let isEndurance = false;
+  if (item.exerciseType === 'endurance' || item.isEndurance === true || theme === 'endurance') {
+    isEndurance = true;
+  } else if (item.exerciseType === 'strength' || item.exerciseType === 'recovery' || isRec) {
+    isEndurance = false;
+  } else {
+    const catLower = (item.category || item.mainCategory || '').toLowerCase();
+    if (/állóképességi|allokepessegi|endurance|kardió|cardio/.test(catLower)) {
+      isEndurance = true;
+    } else if (/erőfejlesztő|erofejleszto|strength|regeneráció|recovery/.test(catLower)) {
+      isEndurance = false;
+    } else if (typeof _templateActiveCategory !== 'undefined' && _templateActiveCategory === 'endurance' && theme !== 'recovery') {
+      isEndurance = true;
+    } else if (typeof _isEnduranceSport === 'function' && item.sportId && _isEnduranceSport(item.sportId)) {
+      isEndurance = true;
+    } else if (/futás|futópad|kocogás|bringa|kerékpár|országúti|mtb|úszás|evezés|kajak|kenu|sup|kardió|cardio|sprint|gyaloglás|túra|intervallum|bike|run|swim|rowing/i.test(rawName)) {
+      isEndurance = true;
+    } else if (typeof _isEnduranceSport === 'function' && _isEnduranceSport(document.getElementById('wo-new-routine-sport')?.value)) {
+      isEndurance = true;
+    }
+  }
+
+  row.className = 'wo-structured-ex-row p-2.5 sm:p-3 rounded-2xl bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 transition-all';
+  row.dataset.name = rawName;
+  row.dataset.muscle = muscleKey;
+  row.dataset.exerciseType = isEndurance ? 'endurance' : (isRec ? 'recovery' : 'strength');
+
+  if (isEndurance) {
+    let enduranceIcon = 'fa-solid fa-person-running';
+    const nl = (rawName + ' ' + (item.sportId || '')).toLowerCase();
+    if (/bringa|kerékpár|bike|cycling/i.test(nl)) enduranceIcon = 'fa-solid fa-person-biking';
+    else if (/úszás|swim/i.test(nl)) enduranceIcon = 'fa-solid fa-person-swimming';
+    else if (/evezés|rowing|kajak|kenu|sup/i.test(nl)) enduranceIcon = 'fa-solid fa-water';
+    else if (/gyalog|túra|walk|hike/i.test(nl)) enduranceIcon = 'fa-solid fa-person-hiking';
+
+    const measureMode = item.measureMode || 'distance'; // 'distance' | 'time'
+    const isTimeMode = measureMode === 'time';
+    const measureVal = item.measureVal !== undefined && item.measureVal !== null && item.measureVal !== ''
+      ? item.measureVal
+      : (isTimeMode ? '30' : '5');
+
+    const targetMode = item.targetMode || 'zone'; // 'zone' | 'pace'
+    const isPaceMode = targetMode === 'pace';
+    const paceVal = item.pace || '5:00';
+    const selectedZone = parseInt(item.zone, 10) || 2;
+
+    row.dataset.measureMode = measureMode;
+    row.dataset.targetMode = targetMode;
+    row.dataset.selectedZone = String(selectedZone);
+
+    const zoneDefs = [
+      { zone: 1, name: 'Szürke', color: '#94A3B8' },
+      { zone: 2, name: 'Kék', color: '#3B82F6' },
+      { zone: 3, name: 'Zöld', color: '#22C55E' },
+      { zone: 4, name: 'Narancs', color: '#FF5400' },
+      { zone: 5, name: 'Piros', color: '#EF4444' }
+    ];
+
+    const renderZoneBtns = (activeZ) => {
+      return zoneDefs.map(z => {
+        const isActive = parseInt(activeZ, 10) === z.zone;
+        const style = isActive
+          ? `background-color: ${z.color}; color: ${z.zone === 1 ? '#000000' : '#ffffff'}; border-color: ${z.color}; box-shadow: 0 0 10px ${z.color}88;`
+          : `background-color: transparent; color: ${z.color}; border-color: ${z.color}66;`;
+        return `<button type="button" class="wo-zone-btn w-6 h-6 rounded-lg text-xs font-black transition-all flex items-center justify-center border cursor-pointer active:scale-95" data-zone="${z.zone}" style="${style}" title="Zóna ${z.zone} (${z.name})">${z.zone}</button>`;
+      }).join('');
+    };
+
+    row.innerHTML = `
+      <!-- Bal oldal: Ikon és Nem szerkeszthető név -->
+      <div class="flex items-center justify-between sm:justify-start gap-2.5 min-w-0 flex-1">
+        <div class="w-8 h-8 rounded-xl bg-orange-500/15 text-[#FF5400] flex items-center justify-center text-xs flex-shrink-0">
+          <i class="${enduranceIcon}"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <h5 class="wo-ex-name-display text-xs sm:text-sm font-bold text-gray-900 dark:text-white truncate" title="${escName}">${escName}</h5>
+          <p class="text-[10px] text-gray-400 font-medium truncate">${item.subcategory || 'Állóképességi'}</p>
+        </div>
+        <!-- Mobil Törlés (X) gomb -->
+        <button type="button" class="wo-remove-ex-row-btn sm:hidden w-7 h-7 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-500/10 flex items-center justify-center transition-colors" title="Eltávolítás">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+
+      <!-- Jobb oldal: Állóképességi vezérlők (Táv/Idő + Tempó/Zónák) és Desktop Törlés (X) gomb -->
+      <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 justify-end flex-shrink-0">
+        <!-- Rejtett kompatibilitási sorozat mező -->
+        <input type="hidden" class="wo-ex-sets" value="${setsVal || 1}" />
+
+        <!-- 1. TÁV / IDŐ VÁLASZTÓ ÉS ÉRTÉK -->
+        <div class="flex items-center gap-1.5 bg-gray-50 dark:bg-slate-800 p-1 rounded-xl border border-gray-200 dark:border-slate-700">
+          <div class="flex items-center bg-gray-200/70 dark:bg-slate-900 p-0.5 rounded-lg text-[10px] font-bold select-none">
+            <button type="button" class="wo-endurance-mode-btn px-2 py-0.5 rounded-md transition-all cursor-pointer ${!isTimeMode ? 'bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-400 hover:text-gray-200'}" data-mode="distance">
+              Táv
+            </button>
+            <button type="button" class="wo-endurance-mode-btn px-2 py-0.5 rounded-md transition-all cursor-pointer ${isTimeMode ? 'bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-400 hover:text-gray-200'}" data-mode="time">
+              Idő
+            </button>
+          </div>
+          <div class="flex items-center gap-1 px-1">
+            <input type="number" step="${isTimeMode ? '1' : '0.1'}" min="0" placeholder="${isTimeMode ? '30' : '5'}" value="${measureVal}"
+                   class="wo-ex-measure-val w-12 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="${isTimeMode ? 'Időtartam (perc)' : 'Távolság (km)'}" />
+            <span class="wo-ex-measure-unit text-[10px] text-gray-400 font-bold select-none">${isTimeMode ? 'perc' : 'km'}</span>
+          </div>
+        </div>
+
+        <!-- 2. TEMPÓ / PULZUSZÓNA VÁLASZTÓ ÉS ÉRTÉK / 1-5 ZÓNÁK -->
+        <div class="flex items-center gap-1.5 bg-gray-50 dark:bg-slate-800 p-1 rounded-xl border border-gray-200 dark:border-slate-700">
+          <div class="flex items-center bg-gray-200/70 dark:bg-slate-900 p-0.5 rounded-lg text-[10px] font-bold select-none">
+            <button type="button" class="wo-endurance-target-btn px-2 py-0.5 rounded-md transition-all cursor-pointer ${isPaceMode ? 'bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-400 hover:text-gray-200'}" data-target="pace">
+              Tempó
+            </button>
+            <button type="button" class="wo-endurance-target-btn px-2 py-0.5 rounded-md transition-all cursor-pointer ${!isPaceMode ? 'bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-400 hover:text-gray-200'}" data-target="zone">
+              Zóna
+            </button>
+          </div>
+
+          <!-- Tempó beviteli mező -->
+          <div class="wo-endurance-pace-container flex items-center gap-1 px-1 ${isPaceMode ? '' : 'hidden'}">
+            <input type="text" placeholder="5:00" value="${paceVal}"
+                   class="wo-ex-pace-val w-12 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Céltempó (/km)" />
+            <span class="text-[10px] text-gray-400 font-bold select-none">/km</span>
+          </div>
+
+          <!-- Pulzuszóna 1-5 gombok (nem konkrét bpm szám, hanem zónák színekkel: 1 szürke, 2 kék, 3 zöld, 4 narancs, 5 piros) -->
+          <div class="wo-endurance-zone-container flex items-center gap-1 px-0.5 ${isPaceMode ? 'hidden' : ''}">
+            ${renderZoneBtns(selectedZone)}
+          </div>
+        </div>
+
+        <!-- Desktop Törlés (X) gomb -->
+        <button type="button" class="wo-remove-ex-row-btn hidden sm:flex w-7 h-7 rounded-xl text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 items-center justify-center transition-colors" title="Eltávolítás">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+    `;
+
+    // Eseménykezelők: Táv vs Idő váltó
+    const measureIn = row.querySelector('.wo-ex-measure-val');
+    const unitSpan = row.querySelector('.wo-ex-measure-unit');
+    const modeBtns = row.querySelectorAll('.wo-endurance-mode-btn');
+
+    modeBtns.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const mode = btn.dataset.mode;
+        row.dataset.measureMode = mode;
+        modeBtns.forEach(b => {
+          if (b.dataset.mode === mode) {
+            b.className = 'wo-endurance-mode-btn px-2 py-0.5 rounded-md transition-all cursor-pointer bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs';
+          } else {
+            b.className = 'wo-endurance-mode-btn px-2 py-0.5 rounded-md transition-all cursor-pointer text-gray-400 hover:text-gray-200';
+          }
+        });
+        if (mode === 'time') {
+          if (unitSpan) unitSpan.textContent = 'perc';
+          if (measureIn) {
+            measureIn.step = '1';
+            measureIn.placeholder = '30';
+            if (!measureIn.value || measureIn.value === '5') measureIn.value = '30';
+          }
+        } else {
+          if (unitSpan) unitSpan.textContent = 'km';
+          if (measureIn) {
+            measureIn.step = '0.1';
+            measureIn.placeholder = '5';
+            if (!measureIn.value || measureIn.value === '30') measureIn.value = '5';
+          }
+        }
+      });
+    });
+
+    // Eseménykezelők: Tempó vs Zóna váltó
+    const paceContainer = row.querySelector('.wo-endurance-pace-container');
+    const zoneContainer = row.querySelector('.wo-endurance-zone-container');
+    const targetBtns = row.querySelectorAll('.wo-endurance-target-btn');
+
+    targetBtns.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const target = btn.dataset.target;
+        row.dataset.targetMode = target;
+        targetBtns.forEach(b => {
+          if (b.dataset.target === target) {
+            b.className = 'wo-endurance-target-btn px-2 py-0.5 rounded-md transition-all cursor-pointer bg-white dark:bg-slate-700 text-gray-900 dark:text-white shadow-xs';
+          } else {
+            b.className = 'wo-endurance-target-btn px-2 py-0.5 rounded-md transition-all cursor-pointer text-gray-400 hover:text-gray-200';
+          }
+        });
+        if (target === 'pace') {
+          paceContainer?.classList.remove('hidden');
+          zoneContainer?.classList.add('hidden');
+        } else {
+          paceContainer?.classList.add('hidden');
+          zoneContainer?.classList.remove('hidden');
+        }
+      });
+    });
+
+    // Eseménykezelők: 1-5 Zóna gombok
+    row.querySelectorAll('.wo-zone-btn').forEach(zBtn => {
+      zBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const zNum = parseInt(zBtn.dataset.zone, 10);
+        row.dataset.selectedZone = String(zNum);
+        row.querySelectorAll('.wo-zone-btn').forEach(b => {
+          const bZ = parseInt(b.dataset.zone, 10);
+          const zDef = zoneDefs.find(zd => zd.zone === bZ) || { color: '#94A3B8' };
+          if (bZ === zNum) {
+            b.style.backgroundColor = zDef.color;
+            b.style.color = zDef.zone === 1 ? '#000000' : '#ffffff';
+            b.style.borderColor = zDef.color;
+            b.style.boxShadow = `0 0 10px ${zDef.color}88`;
+          } else {
+            b.style.backgroundColor = 'transparent';
+            b.style.color = zDef.color;
+            b.style.borderColor = `${zDef.color}66`;
+            b.style.boxShadow = 'none';
+          }
+        });
+      });
+    });
+
+  } else {
+    // ERŐFEJLESZTŐ VAGY REGENERÁCIÓS GYAKORLATSOR (Súly, Sorozat, Ismétlés)
+    const iconClass = isRec ? 'fa-solid fa-spa' : 'fa-solid fa-dumbbell';
+    const badgeBg = isRec ? 'bg-violet-50 dark:bg-violet-950/60' : 'bg-indigo-50 dark:bg-indigo-950/60';
+    const badgeText = isRec ? 'text-violet-600 dark:text-violet-400' : 'text-indigo-600 dark:text-indigo-400';
+
+    row.innerHTML = `
+      <!-- Bal oldal: Ikon és Nem szerkeszthető név -->
+      <div class="flex items-center justify-between sm:justify-start gap-2.5 min-w-0 flex-1">
+        <div class="w-8 h-8 rounded-xl ${badgeBg} ${badgeText} flex items-center justify-center text-xs flex-shrink-0">
+          <i class="${iconClass}"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <h5 class="wo-ex-name-display text-xs sm:text-sm font-bold text-gray-900 dark:text-white truncate" title="${escName}">${escName}</h5>
+          <p class="text-[10px] text-gray-400 font-medium truncate">${isRec ? 'Regeneráció' : 'Erőfejlesztő'}</p>
+        </div>
+        <!-- Mobil Törlés (X) gomb -->
+        <button type="button" class="wo-remove-ex-row-btn sm:hidden w-7 h-7 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-500/10 flex items-center justify-center transition-colors" title="Eltávolítás">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+
+      <!-- Jobb oldal: Súly (kg), Sorozat, Ismétlés, és Desktop Törlés (X) gomb -->
+      <div class="flex items-center gap-2 justify-end flex-shrink-0">
+        <!-- Súly (kg) -->
+        <div class="flex items-center gap-1 bg-gray-50 dark:bg-slate-800 px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-slate-700">
+          <input type="number" step="0.5" min="0" placeholder="—" value="${weightVal}"
+                 class="wo-ex-weight w-12 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Súly (kg)" />
+          <span class="text-[10px] text-gray-400 font-bold select-none">kg</span>
+        </div>
+        <!-- Sorozat -->
+        <div class="flex items-center gap-1 bg-gray-50 dark:bg-slate-800 px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-slate-700">
+          <input type="number" min="1" max="99" value="${setsVal}"
+                 class="wo-ex-sets w-8 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Sorozatok száma" />
+          <span class="text-[10px] text-gray-400 font-bold select-none">sor.</span>
+        </div>
+        <!-- Ismétlés -->
+        <div class="flex items-center gap-1 bg-gray-50 dark:bg-slate-800 px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-slate-700">
+          <input type="number" min="1" max="999" value="${repsVal}"
+                 class="wo-ex-reps w-10 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Ismétlések száma" />
+          <span class="text-[10px] text-gray-400 font-bold select-none">ism.</span>
+        </div>
+        <!-- Desktop Törlés (X) gomb -->
+        <button type="button" class="wo-remove-ex-row-btn hidden sm:flex w-7 h-7 rounded-xl text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 items-center justify-center transition-colors" title="Eltávolítás">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+    `;
+  }
+
+  row.querySelectorAll('.wo-remove-ex-row-btn').forEach(btn => {
+    btn.onclick = () => row.remove();
+  });
+  return row;
+}
+
+function _createStructuredExerciseRow(item = { name: '', muscle: 'chest', sets: 4, reps: 10, weight: '' }) {
+  return _createStructuredExerciseStrip(item, 'workout');
+}
+
+function _parseExerciseLine(line) {
+  let exName = line;
+  let sets = 4;
+  let reps = 10;
+  let weight = '';
+  let muscle = 'chest';
+  let isEndurance = false;
+  let measureMode = 'distance';
+  let measureVal = '5';
+  let targetMode = 'zone';
+  let zone = 2;
+  let pace = '5:00';
+
+  const nl = line.toLowerCase();
+  const hasEnduranceUnits = /\b(\d+(?:\.\d+)?)\s*(?:km|perc|p|min)\b/i.test(line);
+  const hasEnduranceTargets = /zóna\s*[1-5]|tempó/i.test(line);
+  const matchesEnduranceKeywords = /futás|futópad|kocogás|bringa|kerékpár|országúti|mtb|úszás|evezés|kajak|kenu|sup|kardió|cardio|sprint|gyaloglás|túra/i.test(nl);
+
+  if (hasEnduranceUnits || hasEnduranceTargets || matchesEnduranceKeywords) {
+    isEndurance = true;
+    const nameMatch = line.match(/^([^:0-9(]+)/);
+    if (nameMatch) exName = nameMatch[1].trim();
+
+    const timeMatch = line.match(/(\d+(?:\.\d+)?)\s*(?:perc|p|min)/i);
+    const distMatch = line.match(/(\d+(?:\.\d+)?)\s*km/i);
+    if (timeMatch) {
+      measureMode = 'time';
+      measureVal = timeMatch[1];
+    } else if (distMatch) {
+      measureMode = 'distance';
+      measureVal = distMatch[1];
+    }
+
+    const paceMatch = line.match(/tempó:?\s*([0-9:]+)/i);
+    const zoneMatch = line.match(/zóna\s*([1-5])/i);
+    if (paceMatch) {
+      targetMode = 'pace';
+      pace = paceMatch[1];
+    } else if (zoneMatch) {
+      targetMode = 'zone';
+      zone = parseInt(zoneMatch[1], 10);
+    }
+  } else {
+    const match = line.match(/^([^:×x(]+)(?::\s*|\s+)?(?:(\d+)\s*[×x]\s*(\d+))?(?:\s*\(([^)]+)\))?/i);
+    if (match) {
+      if (match[1]) exName = match[1].trim();
+      if (match[2]) sets = parseInt(match[2], 10) || 4;
+      if (match[3]) reps = parseInt(match[3], 10) || 10;
+      if (match[4]) {
+        const wMatch = match[4].match(/(\d+(?:\.\d+)?)/);
+        if (wMatch) weight = parseFloat(wMatch[1]) || '';
+      }
+    }
+  }
+
+  const exLower = exName.toLowerCase();
+  if (/guggol|squat|láb|leg|comb/i.test(exLower)) muscle = 'quads';
+  else if (/felhúz|deadlift/i.test(exLower)) muscle = 'lower_back';
+  else if (/húzódz|pull|evez|lat/i.test(exLower)) muscle = 'lats';
+  else if (/váll|shoulder|overhead|military/i.test(exLower)) muscle = 'shoulders';
+  else if (/biceps/i.test(exLower)) muscle = 'biceps';
+  else if (/triceps/i.test(exLower)) muscle = 'triceps';
+  else if (/has|abs|crunch|plank/i.test(exLower)) muscle = 'abs';
+  else if (/vádli|calf/i.test(exLower)) muscle = 'calves';
+  else if (/hajlító|hamstring|farizom|glute/i.test(exLower)) muscle = 'hamstrings';
+
+  return {
+    name: exName,
+    muscle,
+    sets,
+    reps,
+    weight,
+    isEndurance,
+    measureMode,
+    measureVal,
+    targetMode,
+    zone,
+    pace
+  };
+}
+
+function _openWorkoutModal(dateStr = null) {
+  const modal = $('wo-modal');
+  const sheet = $('wo-modal-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = '';
+
+  const dateIn = $('wo-input-date');
+  if (dateIn) dateIn.value = dateStr || _selectedDate || todayString();
+
+  _populateSportDropdown();
+
+  _selectedWorkoutGearIds.clear();
+  const currentSport = _selectedSportId || 'running';
+  _allGears.forEach(g => {
+    const defSports = Array.isArray(g.defaultSports) ? g.defaultSports : (g.defaultSport ? [g.defaultSport] : []);
+    if (defSports.includes(currentSport)) {
+      _selectedWorkoutGearIds.add(g.id);
+    }
+  });
+  _renderSelectedWorkoutGears();
+
+  _populateDatafieldDropdown();
+  _activeDatafields = [];
+  _renderDatafieldRows();
+
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+window.openWorkoutModal = _openWorkoutModal;
+window.populateGearSelects = _populateGearSelects;
+
+function _closeWorkoutModal() {
+  const modal = $('wo-modal');
+  const sheet = $('wo-modal-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = 'none';
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    modal.style.pointerEvents = '';
+  }, 340);
+}
+
+function _addDatafieldRow() {
+  const picker = $('wo-select-datafield-picker');
+  if (!picker || !picker.value) return;
+
+  const fieldId = picker.value;
+  if (_activeDatafields.some(df => df.id === fieldId)) return;
+
+  const dfDef = getDatafieldById(fieldId);
+  if (!dfDef) return;
+
+  _activeDatafields.push({
+    id: dfDef.id,
+    name: dfDef.name || dfDef.label || dfDef.id,
+    label: dfDef.name || dfDef.label || dfDef.id,
+    unit: dfDef.unit || '',
+    value: ''
+  });
+
+  picker.value = '';
+  _renderDatafieldRows();
+}
+
+function _renderDatafieldRows() {
+  const container = $('wo-datafields-container');
+  if (!container) return;
+
+  if (_activeDatafields.length === 0) {
+    container.innerHTML = '<p class="text-[11px] text-gray-400 italic">Nincs egyedi Garmin adatmező hozzáadva.</p>';
+    return;
+  }
+
+  container.innerHTML = _activeDatafields.map((df, idx) => {
+    const def = getDatafieldById(df.id);
+    const title = df.name || df.label || (def ? def.name : df.id);
+    const unit = df.unit || (def ? def.unit : '');
+    return `
+      <div class="flex items-center gap-2 p-2 rounded-2xl bg-gray-50 dark:bg-slate-800 border border-gray-100 dark:border-slate-700">
+        <div class="flex-1 min-w-0">
+          <label class="text-[10px] font-bold text-gray-500 uppercase tracking-wider block">${title}${unit ? ` (${unit})` : ''}</label>
+          <input type="text" placeholder="${def?.placeholder ? `pl. ${def.placeholder}` : 'pl. 142 vagy 5:15'}" value="${df.value || ''}" data-idx="${idx}"
+                 class="wo-df-input w-full bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-600 rounded-xl px-2.5 py-1 text-xs focus:outline-none" />
+        </div>
+        <button type="button" class="wo-df-remove-btn text-gray-400 hover:text-red-500 p-1.5" data-idx="${idx}">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.wo-df-input').forEach(inp => {
+    inp.addEventListener('input', (e) => {
+      const i = parseInt(inp.dataset.idx, 10);
+      if (_activeDatafields[i]) _activeDatafields[i].value = e.target.value;
+    });
+  });
+
+  container.querySelectorAll('.wo-df-remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = parseInt(btn.dataset.idx, 10);
+      _activeDatafields.splice(i, 1);
+      _renderDatafieldRows();
+    });
+  });
+}
+
+async function _saveWorkout() {
+  if (!_uid) return;
+
+  const nameIn = $('wo-input-name');
+  const dateIn = $('wo-input-date');
+  const durIn = $('wo-input-duration');
+  const calIn = $('wo-input-calories');
+  const exIn = $('wo-input-exercises');
+  const notesIn = $('wo-input-notes');
+  const gearSelect = $('wo-gear-select') || $('wo-select-gear');
+  const kmIn = $('wo-input-distance');
+  const saveBtn = $('wo-save-btn');
+
+  const sport = getSportById(_selectedSportId);
+  const name = nameIn?.value.trim() || sport?.name || 'Edzés';
+  const date = dateIn?.value || todayString();
+  const duration = parseInt(durIn?.value, 10) || 60;
+  const calories = parseInt(calIn?.value, 10) || 0;
+  const notes = notesIn?.value.trim() || '';
+  const gearIds = Array.from(_selectedWorkoutGearIds);
+  const gearNames = gearIds.map(id => _allGears.find(g => g.id === id)?.name).filter(Boolean);
+  const gearId = gearIds[0] || (gearSelect?.value || '');
+  const gearName = gearNames[0] || '';
+  const distanceKm = parseFloat(kmIn?.value) || 0;
+
+  // Strukturált gyakorlatok és szériák begyűjtése
+  const exContainer = $('wo-structured-exercises-container');
+  const exerciseItems = [];
+  const exerciseLines = [];
+  const structuredMuscles = [];
+
+  if (exContainer) {
+    exContainer.querySelectorAll('.wo-structured-ex-row').forEach(row => {
+      const exName = row.querySelector('.wo-ex-name-input')?.value.trim() || row.dataset.name || row.querySelector('.wo-ex-name-display')?.textContent.trim() || 'Gyakorlat';
+      const muscle = row.querySelector('.wo-ex-muscle-select')?.value || row.dataset.muscle || '';
+      const isEnduranceRow = row.dataset.exerciseType === 'endurance';
+
+      if (isEnduranceRow) {
+        const measureMode = row.dataset.measureMode || 'distance';
+        const measureVal = row.querySelector('.wo-ex-measure-val')?.value.trim() || (measureMode === 'time' ? '30' : '5');
+        const measureUnit = row.querySelector('.wo-ex-measure-unit')?.textContent.trim() || (measureMode === 'time' ? 'perc' : 'km');
+        const targetMode = row.dataset.targetMode || 'zone';
+        let targetStr = '';
+        if (targetMode === 'zone') {
+          const zone = row.dataset.selectedZone || '2';
+          targetStr = `Zóna ${zone}`;
+        } else {
+          const paceVal = row.querySelector('.wo-ex-pace-val')?.value.trim() || '5:00';
+          targetStr = `Tempó: ${paceVal}/km`;
+        }
+        exerciseItems.push({
+          name: exName,
+          muscle,
+          isEndurance: true,
+          measureMode,
+          measureVal,
+          targetMode,
+          targetStr
+        });
+        exerciseLines.push(`${exName}: ${measureVal} ${measureUnit}${targetStr ? ` (${targetStr})` : ''}`);
+      } else {
+        const sets = parseInt(row.querySelector('.wo-ex-sets')?.value, 10) || 1;
+        const reps = parseInt(row.querySelector('.wo-ex-reps')?.value, 10) || 1;
+        const weightVal = row.querySelector('.wo-ex-weight')?.value.trim();
+        const weight = weightVal ? parseFloat(weightVal) : null;
+
+        exerciseItems.push({ name: exName, muscle, sets, reps, weight });
+        exerciseLines.push(`${exName}: ${sets} × ${reps}${weight ? ` (${weight} kg)` : ''}`);
+      }
+      if (muscle) structuredMuscles.push(muscle);
+    });
+  }
+
+  let exercises = exIn?.value.trim() || '';
+  if (exerciseLines.length > 0) {
+    exercises = exerciseLines.join('\n') + (exercises ? '\n' + exercises : '');
+  }
+
+  // Célzott izomcsoportok kinyerése
+  const targetMuscles = [...structuredMuscles];
+  const combinedText = (exercises + ' ' + notes + ' ' + name).toLowerCase();
+  _allExercises.forEach(ex => {
+    if (ex.name && combinedText.includes(ex.name.toLowerCase())) {
+      if (ex.targetMuscles && Array.isArray(ex.targetMuscles)) targetMuscles.push(...ex.targetMuscles);
+      else if (ex.muscleKey) targetMuscles.push(ex.muscleKey);
+    }
+  });
+
+  const tempWorkout = {
+    name,
+    sportId: _selectedSportId,
+    duration,
+    calories,
+    notes,
+    datafields: _activeDatafields
+  };
+  const sweatLossMl = calcWorkoutSweatLoss(tempWorkout);
+
+  const payload = {
+    name,
+    sportId: _selectedSportId,
+    date,
+    duration,
+    calories,
+    distanceKm,
+    gearId,
+    gearName,
+    gearIds,
+    gearNames,
+    exercises,
+    exerciseItems,
+    notes,
+    targetMuscles: Array.from(new Set(targetMuscles)),
+    datafields: _activeDatafields,
+    sweatLossMl,
+    createdAt: serverTimestamp()
+  };
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Mentés...';
+  }
+
+  try {
+    await addDoc(collection(db, 'users', _uid, 'workouts'), payload);
+
+    // Ha választottunk felszereléseket, minden felszerelésnél kumuláljuk a km-t és az órát
+    if (gearIds.length > 0 && (distanceKm > 0 || duration > 0)) {
+      const hoursAdded = Math.round((duration / 60) * 10) / 10;
+      for (const gid of gearIds) {
+        try {
+          const updates = {};
+          if (distanceKm > 0) updates.totalKm = increment(distanceKm);
+          if (hoursAdded > 0) updates.totalHours = increment(hoursAdded);
+          if (Object.keys(updates).length > 0) {
+            await updateDoc(doc(db, 'users', _uid, 'gear', gid), updates);
+          }
+        } catch (gearErr) {
+          console.warn('[activity] Gear increment error:', gearErr);
+        }
+      }
+    }
+
+    _closeWorkoutModal();
+    if (nameIn) nameIn.value = '';
+    if (exIn) exIn.value = '';
+    if (notesIn) notesIn.value = '';
+    if (exContainer) exContainer.innerHTML = '';
+  } catch (err) {
+    console.error('[activity] Error saving workout:', err);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Edzés mentése';
+    }
+  }
+}
+
+function _renderWorkoutsList() {
+  const container = $('wo-records-list');
+  if (!container) return;
+
+  if (_allWorkouts.length === 0) {
+    container.innerHTML = `
+      <div class="text-center py-10 bg-white dark:bg-slate-900 rounded-3xl border border-gray-100 dark:border-slate-800 p-6">
+        <div class="w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-500 mx-auto flex items-center justify-center mb-3">
+          <i class="fa-solid fa-dumbbell text-xl"></i>
+        </div>
+        <p class="text-xs font-bold text-gray-700 dark:text-gray-300">Még nincs rögzített edzésed</p>
+        <p class="text-[11px] text-gray-400 mt-1">Koppints a + gombra vagy emelj be egy rutint a Rutinok fülről!</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = _allWorkouts.map(w => {
+    const sport = getSportById(w.sportId || 'strength_training');
+    const gearIds = Array.isArray(w.gearIds) ? w.gearIds : (w.gearId ? [w.gearId] : []);
+    const gears = gearIds.map(gid => _allGears.find(g => g.id === gid)).filter(Boolean);
+    return `
+      <div class="activity-workout-item-card p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm transition-all hover:border-indigo-400 dark:hover:border-indigo-500 cursor-pointer" data-id="${w.id}">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-3 flex-1 min-w-0 pr-2">
+            <div class="w-10 h-10 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 flex items-center justify-center flex-shrink-0">
+              <i class="${sport.icon || 'fa-solid fa-dumbbell'} text-base"></i>
+            </div>
+            <div class="min-w-0">
+              <h4 class="text-xs font-bold text-gray-900 dark:text-white truncate">${w.name || sport.name}</h4>
+              <p class="text-[10px] text-gray-400 font-medium">
+                ${w.date} · <span class="text-indigo-600 dark:text-indigo-400 font-bold">${w.duration || 60} perc</span>
+                ${w.distanceKm ? ` · ${w.distanceKm} km` : ''}
+                ${w.calories ? ` · ${w.calories} kcal` : ''}
+              </p>
+            </div>
+          </div>
+          <button class="wo-delete-btn text-gray-300 hover:text-red-500 p-1.5 transition-colors" data-id="${w.id}">
+            <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+          </button>
+        </div>
+
+        ${gears.length > 0 ? `
+          <div class="flex flex-wrap gap-1.5 mb-2">
+            ${gears.map(g => {
+              const icon = g.type === 'bike' ? 'fa-solid fa-bicycle' : (g.type === 'device' ? 'fa-solid fa-stopwatch' : 'fa-solid fa-shoe-prints');
+              return `
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-gray-100 dark:bg-slate-800 text-[10px] text-gray-600 dark:text-gray-300">
+                  <i class="${icon} text-indigo-500"></i>
+                  <span>${g.brand ? `${g.brand} ` : ''}${g.name}</span>
+                </span>
+              `;
+            }).join('')}
+          </div>
+        ` : ''}
+
+        ${w.exercises ? `
+          <div class="p-2.5 rounded-2xl bg-gray-50 dark:bg-slate-800/60 font-mono text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-line leading-relaxed my-1">
+            ${w.exercises}
+          </div>
+        ` : ''}
+
+        ${w.datafields && w.datafields.length > 0 ? `
+          <div class="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-gray-100 dark:border-slate-800">
+            ${w.datafields.map(df => {
+              const def = getDatafieldById(df.id);
+              const label = (df.name && df.name !== 'undefined') ? df.name : ((df.label && df.label !== 'undefined') ? df.label : (def ? def.name : df.id));
+              const unit = df.unit || (def ? def.unit : '');
+              return `
+                <span class="text-[9px] bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 px-2 py-0.5 rounded-md font-semibold">
+                  ${label}: ${df.value} ${unit}
+                </span>
+              `;
+            }).join('')}
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.activity-workout-item-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.wo-delete-btn')) return;
+      const id = card.dataset.id;
+      if (id) {
+        openWorkoutDetailModal(id);
+      }
+    });
+  });
+
+  container.querySelectorAll('.wo-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id && _uid) {
+        try {
+          await deleteDoc(doc(db, 'users', _uid, 'workouts', id));
+        } catch (err) {
+          console.error('[activity] Error deleting workout:', err);
+        }
+      }
+    });
+  });
+}
+
+function _updateWorkoutStats() {
+  const weekEl = $('wo-stat-week');
+  const totalEl = $('wo-stat-total');
+  const streakEl = $('wo-stat-streak');
+
+  if (totalEl) totalEl.textContent = _allWorkouts.length;
+
+  // Heti darabszám
+  const today = new Date();
+  const dayOfWeek = today.getDay();
+  const diffMon = (dayOfWeek === 0 ? -6 : 1 - dayOfWeek);
+  const mon = new Date(today);
+  mon.setDate(today.getDate() + diffMon);
+  const monStr = mon.toISOString().slice(0, 10);
+
+  const weekCount = _allWorkouts.filter(w => w.date >= monStr).length;
+  if (weekEl) weekEl.textContent = weekCount;
+
+  // Napsorozat (streak)
+  const dateSet = new Set(_allWorkouts.map(w => w.date));
+  let streak = 0;
+  let curr = new Date();
+  while (true) {
+    const s = curr.toISOString().slice(0, 10);
+    if (dateSet.has(s)) {
+      streak++;
+      curr.setDate(curr.getDate() - 1);
+    } else {
+      break;
+    }
+  }
+  if (streakEl) streakEl.textContent = streak;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ÖSSZEVONT EDZÉSSABLONOK ÉS REGENERÁCIÓS RUTINOK (3 KATEGÓRIA × 2 AL-FÜL)
+// ══════════════════════════════════════════════════════════════
+
+function _isEnduranceSport(sportId) {
+  const sp = getSportById(sportId);
+  if (!sp) return false;
+  return Boolean(
+    sp.isCardio ||
+    ['Futás', 'Kerékpár', 'Úszás', 'Vízi sport'].includes(sp.cat) ||
+    ['running', 'treadmill_running', 'trail_running', 'cycling', 'road_biking', 'mountain_biking', 'gravel_cycling', 'indoor_cycling', 'pool_swimming', 'open_water_swimming', 'walking', 'hiking', 'rowing'].includes(sp.id)
+  );
+}
+
+function _isStrengthSport(sportId) {
+  const sp = getSportById(sportId);
+  if (!sp) return false;
+  return Boolean(
+    sp.isStrength ||
+    sp.cat === 'Erőnlét' ||
+    ['strength_training', 'weight_training', 'crossfit', 'calisthenics'].includes(sp.id)
+  );
+}
+
+function _isRecoverySport(sportId) {
+  const sp = getSportById(sportId);
+  if (!sp) return false;
+  return ['yoga', 'pilates', 'breathwork', 'stretching', 'mobility'].includes(sp.id);
+}
+
+function _exerciseMatchesCategory(ex, cat) {
+  if (ex.mainCategory && ex.mainCategory === cat) return true;
+  const c = (ex.category || '').toLowerCase();
+  const s = (ex.sportId || '').toLowerCase();
+  const n = (ex.name || '').toLowerCase();
+  if (cat === 'endurance') {
+    return c === 'állóképességi' || c === 'allokepessegi' || c === 'endurance' || c === 'kardió' || c === 'cardio' || _isEnduranceSport(ex.sportId) || /futás|kerékpár|bringa|úszás|sprint|kardió|intervallum/i.test(n);
+  } else if (cat === 'strength') {
+    return c === 'erőfejlesztő' || c === 'erofejleszto' || c === 'strength' || c === 'erőnlét' || _isStrengthSport(ex.sportId) || /nyomás|guggol|felhúz|húzódz|evez|bicepsz|tricepsz|tolás|lábtolás|vállból|mell/i.test(n);
+  } else if (cat === 'recovery') {
+    return ['smr', 'nyújtás', 'hideg/meleg', 'légzés', 'mobilitás', 'regeneráció', 'regeneracio', 'recovery'].includes(c) || /smr|nyújt|stretch|légzés|breath|hideg|meleg|sauna|szauna|mobilit|henger|jóga|yoga/i.test(c + ' ' + s + ' ' + n);
+  }
+  return true;
+}
+
+function _matchesSubcategory(item, subcatName, mainCat) {
+  if (!subcatName || subcatName === 'all') return true;
+  const targetSub = subcatName.toLowerCase().trim();
+
+  // Ha az elemen közvetlenül szerepel a subcategory mező
+  if (item.subcategory && item.subcategory.toLowerCase().trim() === targetSub) {
+    return true;
+  }
+
+  // Heurisztikus megfeleltetés ha nincs direkt subcategory
+  const str = `${item.name || ''} ${item.category || ''} ${item.type || ''} ${item.muscle || ''} ${item.notes || ''}`.toLowerCase();
+
+  if (mainCat === 'endurance') {
+    if (targetSub.includes('futás') || targetSub.includes('fut')) {
+      return /fut|run|kocog|jog|sprint|maraton/i.test(str) || item.sportId === 'running' || item.sportId === 'treadmill_running' || item.sportId === 'trail_running';
+    }
+    if (targetSub.includes('kerékpár') || targetSub.includes('bringa') || targetSub.includes('bicikli')) {
+      return /kerékpár|bicikli|bringa|bike|cycling|országúti|mtb|görgő/i.test(str) || item.sportId === 'cycling' || item.sportId === 'indoor_cycling';
+    }
+    if (targetSub.includes('úszás') || targetSub.includes('úsz')) {
+      return /úsz|swim/i.test(str) || item.sportId === 'swimming';
+    }
+    if (targetSub.includes('evezés') || targetSub.includes('kardió') || targetSub.includes('cardio')) {
+      return /evez|row|kardió|cardio|ugráló|jump|hiit/i.test(str) || item.sportId === 'rowing';
+    }
+    if (targetSub.includes('gyalog') || targetSub.includes('túra')) {
+      return /gyalog|túra|walk|hike/i.test(str) || item.sportId === 'walking' || item.sportId === 'hiking';
+    }
+  } else if (mainCat === 'strength') {
+    const m = (item.muscleKey || item.muscle || '').toLowerCase();
+    if (targetSub.includes('felsőtest')) {
+      return /mell|váll|biceps|triceps|hát|lat|kar|chest|shoulder|arm|upper/i.test(str) || ['chest', 'shoulders', 'biceps', 'triceps', 'lats', 'traps', 'forearms'].includes(m);
+    }
+    if (targetSub.includes('alsótest')) {
+      return /láb|guggol|comb|vádli|far|squat|leg|calf|glute|quad|hamstring|lower/i.test(str) || ['quads', 'hamstrings', 'glutes', 'calves', 'adductors'].includes(m);
+    }
+    if (targetSub.includes('core') || targetSub.includes('törzs')) {
+      return /has|plank|törzs|abs|core|derék/i.test(str) || ['abs', 'obliques', 'lower_back'].includes(m);
+    }
+    if (targetSub.includes('push') || targetSub.includes('nyomás')) {
+      return /push|nyom|fekve|mell|tolódz|military/i.test(str) || ['chest', 'shoulders', 'triceps'].includes(m);
+    }
+    if (targetSub.includes('pull') || targetSub.includes('húzás')) {
+      return /pull|húz|evez|lat|deadlift|felhúz/i.test(str) || ['lats', 'traps', 'biceps'].includes(m);
+    }
+    if (targetSub.includes('teljes test')) {
+      return /teljes test|full body|komplex|burpee|kettlebell/i.test(str) || m === 'all';
+    }
+  } else if (mainCat === 'recovery') {
+    if (targetSub.includes('smr') || targetSub.includes('henger')) {
+      return /smr|henger|roll|foam/i.test(str) || item.type === 'smr';
+    }
+    if (targetSub.includes('nyújtás') || targetSub.includes('mobilit')) {
+      return /nyújt|stretch|mobilit|statikus|dinamikus/i.test(str) || item.type === 'stretch' || item.type === 'mobility';
+    }
+    if (targetSub.includes('légzés') || targetSub.includes('fókusz')) {
+      return /légzés|lélegz|breath|fókusz|medit/i.test(str) || item.type === 'breath';
+    }
+    if (targetSub.includes('szauna') || targetSub.includes('hideg')) {
+      return /szauna|sauna|hideg|jeges|fürdő|cold|ice/i.test(str) || item.type === 'cold' || item.type === 'sauna';
+    }
+  }
+
+  return str.includes(targetSub);
+}
+
+function _updateSubcategoryDatalists() {
+  const allSubcats = new Set();
+  Object.values(DEFAULT_SUBCATEGORIES).forEach(list => list.forEach(s => allSubcats.add(s)));
+  _customSubcategories.forEach(s => { if (s.name) allSubcats.add(s.name); });
+
+  const optsHtml = Array.from(allSubcats).map(s => `<option value="${s}">`).join('');
+
+  const exDatalist = $('wo-ex-subcats-datalist');
+  const routineDatalist = $('wo-routine-subcats-datalist');
+  const protoDatalist = $('rec-proto-subcats-datalist');
+
+  if (exDatalist) exDatalist.innerHTML = optsHtml;
+  if (routineDatalist) routineDatalist.innerHTML = optsHtml;
+  if (protoDatalist) protoDatalist.innerHTML = optsHtml;
+}
+
+function _renderUnifiedSubcategoriesBar() {
+  const container = $('unified-subcategories-bar');
+  if (!container) return;
+
+  const mainCat = _templateActiveCategory;
+  const defaultSubs = DEFAULT_SUBCATEGORIES[mainCat] || [];
+  const customSubs = _customSubcategories.filter(s => s.mainCategory === mainCat);
+
+  const isAllActive = !_activeTemplateSubcategory || _activeTemplateSubcategory === 'all';
+  const allChip = `
+    <button type="button" class="unified-subcat-chip flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-extrabold transition-all active:scale-95 ${isAllActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-white dark:bg-[#181A20] text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-[#262832] hover:border-gray-300'}" data-subcat="all">
+      Összes
+    </button>
+  `;
+
+  const defaultChips = defaultSubs.map(subName => {
+    const isActive = _activeTemplateSubcategory === subName;
+    return `
+      <button type="button" class="unified-subcat-chip flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-extrabold transition-all active:scale-95 ${isActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-white dark:bg-[#181A20] text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-[#262832] hover:border-gray-300'}" data-subcat="${subName}">
+        ${subName}
+      </button>
+    `;
+  }).join('');
+
+  const customChips = customSubs.map(sub => {
+    const isActive = _activeTemplateSubcategory === sub.name;
+    return `
+      <div class="flex-shrink-0 flex items-center rounded-xl transition-all border ${isActive ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm' : 'bg-white dark:bg-[#181A20] text-gray-600 dark:text-gray-300 border-gray-200 dark:border-[#262832] hover:border-gray-300'}">
+        <button type="button" class="unified-subcat-chip px-2.5 py-1.5 text-xs font-extrabold active:scale-95" data-subcat="${sub.name}">
+          ${sub.name}
+        </button>
+        <button type="button" class="unified-del-custom-subcat-btn pr-2 py-1.5 text-gray-400 hover:text-red-500 transition-colors text-[10px]" data-id="${sub.id}" data-name="${sub.name}" title="Alkategória törlése">
+          <i class="fa-solid fa-xmark pointer-events-none"></i>
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = allChip + defaultChips + customChips;
+
+  container.querySelectorAll('.unified-subcat-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _activeTemplateSubcategory = btn.dataset.subcat || 'all';
+      _renderUnifiedSubcategoriesBar();
+      _renderUnifiedTemplatesScreen();
+    });
+  });
+
+  container.querySelectorAll('.unified-del-custom-subcat-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const name = btn.dataset.name;
+      if (!id) return;
+      const uid = _getEffectiveUid();
+      if (!confirm(`Biztosan törlöd a(z) "${name}" alkategóriát?`)) return;
+      _customSubcategories = _customSubcategories.filter(s => s.id !== id && s.name !== name);
+      _saveSubcatsToLocal(uid);
+      if (_activeTemplateSubcategory === name) {
+        _activeTemplateSubcategory = 'all';
+      }
+      _renderUnifiedSubcategoriesBar();
+      _updateSubcategoryDatalists();
+      _renderUnifiedTemplatesScreen();
+      if (db && uid && !uid.startsWith('local_')) {
+        deleteDoc(doc(db, 'users', uid, 'customSubcategories', id)).catch(err => {
+          console.warn('[activity] Error deleting subcategory:', err);
+        });
+      }
+    });
+  });
+}
+
+function _bindUnifiedTemplatesEvents() {
+  const catEndurance = $('templates-cat-endurance');
+  const catStrength = $('templates-cat-strength');
+  const catRecovery = $('templates-cat-recovery');
+
+  const subPrograms = $('templates-sub-programs');
+  const subExercises = $('templates-sub-exercises');
+
+  const addTemplateBtn = $('unified-add-template-btn');
+  const addExerciseBtn = $('unified-add-exercise-btn');
+  const addExerciseProgramsBtn = $('unified-add-exercise-btn-programs');
+
+  const searchTemplates = $('unified-templates-search');
+  const searchExercises = $('unified-exercises-search');
+
+  // Új alkategória létrehozása modál elemei
+  const addSubcatBtn = $('unified-add-subcat-btn');
+  const newSubcatModal = $('unified-new-subcat-modal');
+  const newSubcatSheet = $('unified-new-subcat-sheet');
+  const newSubcatClose = $('unified-new-subcat-close');
+  const newSubcatBackdrop = $('unified-new-subcat-backdrop');
+  const newSubcatSaveBtn = $('unified-new-subcat-save-btn');
+  const newSubcatMaincat = $('unified-new-subcat-maincat');
+  const newSubcatName = $('unified-new-subcat-name');
+
+  const openNewSubcatModal = () => {
+    if (!newSubcatModal || !newSubcatSheet) return;
+    newSubcatModal.style.pointerEvents = '';
+    if (newSubcatMaincat) newSubcatMaincat.value = _templateActiveCategory;
+    if (newSubcatName) newSubcatName.value = '';
+    newSubcatModal.classList.remove('hidden');
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        newSubcatSheet.style.transform = 'translateY(0)';
+        newSubcatName?.focus();
+      });
+    });
+  };
+
+  const closeNewSubcatModal = () => {
+    if (!newSubcatModal || !newSubcatSheet) return;
+    newSubcatModal.style.pointerEvents = 'none';
+    newSubcatSheet.style.transform = 'translateY(100%)';
+    setTimeout(() => {
+      newSubcatModal.classList.add('hidden');
+      newSubcatModal.style.pointerEvents = '';
+    }, 300);
+  };
+
+  if (addSubcatBtn) addSubcatBtn.addEventListener('click', openNewSubcatModal);
+  if (newSubcatClose) newSubcatClose.addEventListener('click', closeNewSubcatModal);
+  if (newSubcatBackdrop) newSubcatBackdrop.addEventListener('click', closeNewSubcatModal);
+
+  if (newSubcatSaveBtn) {
+    newSubcatSaveBtn.addEventListener('click', async () => {
+      const uid = _getEffectiveUid();
+      const name = newSubcatName?.value.trim();
+      const mainCategory = newSubcatMaincat?.value || _templateActiveCategory;
+      if (!name) {
+        alert('Kérlek add meg az alkategória nevét!');
+        newSubcatName?.focus();
+        return;
+      }
+
+      const subcatId = 'sub_' + Date.now();
+      const localSub = { id: subcatId, name, mainCategory, createdAt: new Date().toISOString() };
+      _customSubcategories.push(localSub);
+      _saveSubcatsToLocal(uid);
+      _activeTemplateSubcategory = name;
+      closeNewSubcatModal();
+      _renderUnifiedSubcategoriesBar();
+      _updateSubcategoryDatalists();
+      _renderUnifiedTemplatesScreen();
+
+      if (db && uid && !uid.startsWith('local_')) {
+        addDoc(collection(db, 'users', uid, 'customSubcategories'), {
+          name,
+          mainCategory,
+          createdAt: serverTimestamp()
+        }).then(ref => {
+          localSub.id = ref.id;
+          _saveSubcatsToLocal(uid);
+        }).catch(err => {
+          console.warn('[activity] Error saving custom subcategory:', err);
+        });
+      }
+    });
+  }
+
+  if (catEndurance) {
+    catEndurance.addEventListener('click', () => {
+      _templateActiveCategory = 'endurance';
+      _activeTemplateSubcategory = 'all';
+      _renderUnifiedTemplatesScreen();
+    });
+  }
+  if (catStrength) {
+    catStrength.addEventListener('click', () => {
+      _templateActiveCategory = 'strength';
+      _activeTemplateSubcategory = 'all';
+      _renderUnifiedTemplatesScreen();
+    });
+  }
+  if (catRecovery) {
+    catRecovery.addEventListener('click', () => {
+      _templateActiveCategory = 'recovery';
+      _activeTemplateSubcategory = 'all';
+      _renderUnifiedTemplatesScreen();
+    });
+  }
+
+  if (subPrograms) {
+    subPrograms.addEventListener('click', () => {
+      _templateActiveSub = 'programs';
+      _renderUnifiedTemplatesScreen();
+    });
+  }
+  if (subExercises) {
+    subExercises.addEventListener('click', () => {
+      _templateActiveSub = 'exercises';
+      _renderUnifiedTemplatesScreen();
+    });
+  }
+
+  if (addTemplateBtn) {
+    addTemplateBtn.addEventListener('click', () => {
+      if (_templateActiveCategory === 'recovery') {
+        _openProtocolsModal();
+        const subcatIn = $('rec-proto-subcat-in');
+        if (subcatIn && _activeTemplateSubcategory !== 'all') {
+          subcatIn.value = _activeTemplateSubcategory;
+        }
+      } else {
+        _openRoutinesModal();
+        const sportSel = $('wo-new-routine-sport');
+        if (sportSel) {
+          sportSel.value = _templateActiveCategory === 'endurance' ? 'running' : 'strength_training';
+        }
+        const subcatIn = $('wo-new-routine-subcat');
+        if (subcatIn && _activeTemplateSubcategory !== 'all') {
+          subcatIn.value = _activeTemplateSubcategory;
+        }
+      }
+    });
+  }
+
+  const openNewExerciseHandler = (fromTab = 'programs') => {
+    _activeExerciseTarget = fromTab;
+    if (typeof window !== 'undefined') window._activeExerciseTarget = fromTab;
+    _openExercisesModal();
+    const catIn = $('wo-new-ex-cat');
+    if (catIn) {
+      if (_templateActiveCategory === 'endurance') catIn.value = 'Állóképességi';
+      else if (_templateActiveCategory === 'recovery') catIn.value = 'Regeneráció';
+      else catIn.value = 'Erőfejlesztő';
+    }
+    const targetSubcat = (_activeTemplateSubcategory && _activeTemplateSubcategory !== 'all') ? _activeTemplateSubcategory : '';
+    _updateExerciseSubcatDropdown(targetSubcat);
+    const nameIn = $('wo-new-ex-name');
+    if (nameIn) {
+      setTimeout(() => {
+        nameIn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        nameIn.focus();
+      }, 320);
+    }
+  };
+
+  if (addExerciseBtn) addExerciseBtn.addEventListener('click', () => openNewExerciseHandler('exercises'));
+  if (addExerciseProgramsBtn) addExerciseProgramsBtn.addEventListener('click', () => openNewExerciseHandler('programs'));
+
+  if (searchTemplates) {
+    searchTemplates.addEventListener('input', (e) => {
+      _unifiedTemplateSearchQuery = e.target.value;
+      _renderUnifiedProgramsList();
+    });
+  }
+
+  if (searchExercises) {
+    searchExercises.addEventListener('input', (e) => {
+      _unifiedExerciseSearchQuery = e.target.value;
+      _renderUnifiedExercisesList();
+    });
+  }
+}
+
+function _renderUnifiedTemplatesScreen() {
+  const catEndurance = $('templates-cat-endurance');
+  const catStrength = $('templates-cat-strength');
+  const catRecovery = $('templates-cat-recovery');
+
+  const subPrograms = $('templates-sub-programs');
+  const subExercises = $('templates-sub-exercises');
+
+  const contentPrograms = $('unified-content-programs');
+  const contentExercises = $('unified-content-exercises');
+
+  const activeCatClass = 'py-2.5 px-2 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-1.5 bg-white dark:bg-[#22242C] text-indigo-600 dark:text-cyan-400 shadow-sm active:scale-95';
+  const inactiveCatClass = 'py-2.5 px-2 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white active:scale-95';
+
+  if (catEndurance) catEndurance.className = _templateActiveCategory === 'endurance' ? activeCatClass : inactiveCatClass;
+  if (catStrength) catStrength.className = _templateActiveCategory === 'strength' ? activeCatClass : inactiveCatClass;
+  if (catRecovery) catRecovery.className = _templateActiveCategory === 'recovery' ? activeCatClass : inactiveCatClass;
+
+  const activeSubClass = 'flex-1 py-1.5 rounded-lg text-xs font-extrabold transition-all bg-white dark:bg-[#22242C] text-indigo-600 dark:text-cyan-400 shadow-sm flex items-center justify-center gap-1.5 active:scale-95';
+  const inactiveSubClass = 'flex-1 py-1.5 rounded-lg text-xs font-extrabold transition-all text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center justify-center gap-1.5 active:scale-95';
+
+  if (subPrograms) subPrograms.className = _templateActiveSub === 'programs' ? activeSubClass : inactiveSubClass;
+  if (subExercises) subExercises.className = _templateActiveSub === 'exercises' ? activeSubClass : inactiveSubClass;
+
+  if (_templateActiveSub === 'programs') {
+    if (contentPrograms) contentPrograms.classList.remove('hidden');
+    if (contentExercises) contentExercises.classList.add('hidden');
+  } else {
+    if (contentExercises) contentExercises.classList.remove('hidden');
+    if (contentPrograms) contentPrograms.classList.add('hidden');
+  }
+
+  const progIcon = $('unified-programs-header-icon');
+  const progText = $('unified-programs-header-text');
+  const progDesc = $('unified-programs-header-desc');
+
+  const exIcon = $('unified-exercises-header-icon');
+  const exText = $('unified-exercises-header-text');
+  const exDesc = $('unified-exercises-header-desc');
+
+  if (_templateActiveCategory === 'endurance') {
+    if (progIcon) progIcon.className = 'fa-solid fa-person-running text-indigo-600 dark:text-cyan-400';
+    if (progText) progText.textContent = 'Állóképességi edzéssablonok';
+    if (progDesc) progDesc.textContent = 'Előre elkészített kardió, futás, bringa és úszás sablonok';
+
+    if (exIcon) exIcon.className = 'fa-solid fa-person-running text-indigo-600 dark:text-cyan-400';
+    if (exText) exText.textContent = 'Állóképességi gyakorlattár';
+    if (exDesc) exDesc.textContent = 'Kardió, futó és aerob gyakorlatok könyvtára';
+  } else if (_templateActiveCategory === 'strength') {
+    if (progIcon) progIcon.className = 'fa-solid fa-dumbbell text-indigo-600 dark:text-cyan-400';
+    if (progText) progText.textContent = 'Erőfejlesztő edzéssablonok';
+    if (progDesc) progDesc.textContent = 'Előre elkészített súlyzós és hipertrófia edzéstervek';
+
+    if (exIcon) exIcon.className = 'fa-solid fa-dumbbell text-indigo-600 dark:text-cyan-400';
+    if (exText) exText.textContent = 'Erőfejlesztő gyakorlattár';
+    if (exDesc) exDesc.textContent = 'Súlyzós és ellenállásos gyakorlatok könyvtára';
+  } else if (_templateActiveCategory === 'recovery') {
+    if (progIcon) progIcon.className = 'fa-solid fa-spa text-violet-600 dark:text-violet-400';
+    if (progText) progText.textContent = 'Regenerációs rutinok (SMR & Nyújtás)';
+    if (progDesc) progDesc.textContent = 'Előre elkészített SMR hengerezési, mobilitási és nyújtási sablonok';
+
+    if (exIcon) exIcon.className = 'fa-solid fa-spa text-violet-600 dark:text-violet-400';
+    if (exText) exText.textContent = 'Regenerációs gyakorlattár';
+    if (exDesc) exDesc.textContent = 'SMR, izomlazító, nyújtó és légzőgyakorlatok könyvtára';
+  }
+
+  _renderUnifiedSubcategoriesBar();
+
+  if (_templateActiveSub === 'programs') {
+    _renderUnifiedProgramsList();
+  } else {
+    _renderUnifiedExercisesList();
+  }
+}
+
+function _renderUnifiedProgramsList() {
+  const container = $('unified-templates-list');
+  if (!container) return;
+
+  const cat = _templateActiveCategory;
+  const deletedRoutines = _getDeletedSampleIds('routines');
+  const deletedProtocols = _getDeletedSampleIds('protocols');
+
+  let items = [];
+
+  if (cat === 'endurance') {
+    const defaultEndurance = (DEFAULT_ROUTINES || []).filter(r =>
+      r.category === 'endurance' || _isEnduranceSport(r.sportId)
+    ).filter(r => !deletedRoutines.includes(r.id) && !deletedRoutines.includes(r.name));
+
+    const userEndurance = (_allRoutines || []).filter(r =>
+      r.category === 'endurance' || _isEnduranceSport(r.sportId)
+    );
+    items = [...defaultEndurance, ...userEndurance].map(r => ({ ...r, _type: 'routine' }));
+  } else if (cat === 'strength') {
+    const defaultStrength = (DEFAULT_ROUTINES || []).filter(r =>
+      r.category === 'strength' || (!r.category && _isStrengthSport(r.sportId))
+    ).filter(r => !deletedRoutines.includes(r.id) && !deletedRoutines.includes(r.name));
+
+    const userStrength = (_allRoutines || []).filter(r =>
+      r.category === 'strength' || (!r.category && _isStrengthSport(r.sportId)) || (!r.sportId && !r.type)
+    );
+    items = [...defaultStrength, ...userStrength].map(r => ({ ...r, _type: 'routine' }));
+  } else if (cat === 'recovery') {
+    const defaultRecovery = (DEFAULT_RECOVERY_PROTOCOLS || []).filter(p =>
+      !deletedProtocols.includes(p.id) && !deletedProtocols.includes(p.name)
+    );
+    const userProtocols = (_allProtocols || []).map(p => ({ ...p, _type: 'protocol' }));
+    const userRoutinesRec = (_allRoutines || []).filter(r =>
+      r.category === 'recovery' || _isRecoverySport(r.sportId)
+    ).map(r => ({ ...r, _type: 'routine' }));
+    items = [...defaultRecovery.map(p => ({ ...p, _type: 'protocol' })), ...userProtocols, ...userRoutinesRec];
+  }
+
+  // Alkategória szerinti szűrés
+  if (_activeTemplateSubcategory && _activeTemplateSubcategory !== 'all') {
+    items = items.filter(it => _matchesSubcategory(it, _activeTemplateSubcategory, cat));
+  }
+
+  // Keresés
+  if (_unifiedTemplateSearchQuery.trim()) {
+    const q = _unifiedTemplateSearchQuery.toLowerCase();
+    items = items.filter(it =>
+      (it.name && it.name.toLowerCase().includes(q)) ||
+      (it.exercises && it.exercises.toLowerCase().includes(q)) ||
+      (it.notes && it.notes.toLowerCase().includes(q)) ||
+      (it.relievedMuscleLabel && it.relievedMuscleLabel.toLowerCase().includes(q))
+    );
+  }
+
+  if (items.length === 0) {
+    container.innerHTML = `
+      <div class="text-center py-8 px-4 rounded-2xl bg-gray-50 dark:bg-slate-800/40 border border-dashed border-gray-200 dark:border-slate-700">
+        <i class="fa-solid fa-folder-open text-2xl text-gray-300 dark:text-gray-600 mb-2"></i>
+        <p class="text-xs font-bold text-gray-600 dark:text-gray-300">Nincs sablon ebben a kategóriában</p>
+        <p class="text-[11px] text-gray-400 mt-1">Kattints a fenti "+ Új sablon" gombra új létrehozásához!</p>
+      </div>
+    `;
+    return;
+  }
+
+  const html = items.map((item, idx) => {
+    const isCustom = Boolean(item.id && !item.isSample);
+    const isProtocol = item._type === 'protocol';
+    const sport = getSportById(item.sportId || (isProtocol ? 'yoga' : 'strength_training'));
+    const iconClass = isProtocol ? 'fa-solid fa-spa' : (sport.icon || 'fa-solid fa-dumbbell');
+    const badgeColor = isProtocol ? 'text-violet-500 bg-violet-50 dark:bg-violet-950/60' : 'text-indigo-500 bg-indigo-50 dark:bg-indigo-950/60';
+    const subLabel = isProtocol
+      ? `${item.duration || 20} perc · ${item.type || 'SMR / Nyújtás'}${item.relievedMuscleLabel ? ` · <span class="text-violet-500 font-semibold">${item.relievedMuscleLabel}</span>` : ''}`
+      : `${item.duration || 60} perc · ${sport.name}${item.distanceKm ? ` · ${item.distanceKm} km` : ''}`;
+
+    return `
+      <div class="p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm transition-all hover:border-gray-200 dark:hover:border-slate-700">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2.5 min-w-0">
+            <div class="w-8 h-8 rounded-xl ${badgeColor} flex items-center justify-center text-xs flex-shrink-0">
+              <i class="${iconClass}"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <h4 class="text-xs font-bold text-gray-900 dark:text-white truncate">${item.name}</h4>
+                ${item.subcategory ? `<span class="text-[9px] px-1.5 py-0.5 rounded-md font-bold bg-gray-100 dark:bg-slate-800 text-gray-600 dark:text-gray-300 border border-gray-200/60 dark:border-slate-700">${item.subcategory}</span>` : ''}
+              </div>
+              <p class="text-[10px] text-gray-400 truncate">${subLabel}</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 flex-shrink-0">
+            <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${isCustom ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400' : 'bg-gray-100 dark:bg-slate-800 text-gray-500'}">
+              ${isCustom ? 'Saját' : 'Minta'}
+            </span>
+            <button class="unified-del-template-btn text-gray-300 hover:text-red-500 p-1 transition-colors"
+                    data-id="${item.id || item.name}"
+                    data-is-sample="${item.isSample ? 'true' : 'false'}"
+                    data-type="${isProtocol ? 'protocol' : 'routine'}"
+                    data-name="${item.name}"
+                    title="${isCustom ? 'Sablon törlése' : 'Minta törlése'}">
+              <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+            </button>
+          </div>
+        </div>
+
+        ${item.exercises ? `
+          <div class="p-3 rounded-2xl bg-gray-50 dark:bg-slate-800/60 font-mono text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-line leading-relaxed mb-3 border border-gray-100/50 dark:border-slate-700/50">
+            ${item.exercises}
+          </div>
+        ` : ''}
+
+        ${item.notes ? `
+          <p class="text-[10px] text-gray-400 italic mb-3 px-1">${item.notes}</p>
+        ` : ''}
+
+        ${isProtocol ? `
+          <button class="unified-apply-template-btn w-full py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-bold text-xs active:scale-95 transition-all flex items-center justify-center gap-1.5 shadow-sm"
+                  data-idx="${idx}">
+            <i class="fa-solid fa-check text-[10px]"></i>
+            <span>Beemelés a mai napba (Rögzítés)</span>
+          </button>
+        ` : `
+          <button class="unified-apply-template-btn w-full py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs active:scale-95 transition-all flex items-center justify-center gap-1.5 shadow-sm"
+                  data-idx="${idx}">
+            <i class="fa-solid fa-plus text-[10px]"></i>
+            <span>Beemelés a mai edzésbe</span>
+          </button>
+        `}
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = html;
+
+  // Törlés események (megerősítéssel!)
+  container.querySelectorAll('.unified-del-template-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const isSample = btn.dataset.isSample === 'true';
+      const type = btn.dataset.type;
+      const name = btn.dataset.name || 'sablon';
+
+      if (isSample) {
+        if (!confirm(`Biztosan elrejted ezt a minta sablont?`)) return;
+        if (type === 'protocol') {
+          _markSampleDeleted('protocols', id);
+        } else {
+          _markSampleDeleted('routines', id);
+        }
+        _renderUnifiedProgramsList();
+        return;
+      }
+
+      if (id) {
+        const uid = _getEffectiveUid();
+        if (!confirm(`Biztosan véglegesen törlöd a(z) "${name}" sablont a sablonkönyvtáradból?`)) return;
+        if (type === 'protocol') {
+          _allProtocols = _allProtocols.filter(p => p.id !== id && p.name !== id);
+          _saveProtocolsToLocal(uid);
+          _renderProtocolsList();
+          _renderUnifiedProgramsList();
+          if (db && uid && !uid.startsWith('local_')) {
+            deleteDoc(doc(db, 'users', uid, 'recoveryProtocols', id)).catch(err => {
+              console.warn('[activity] Error deleting protocol:', err);
+            });
+          }
+        } else {
+          _allRoutines = _allRoutines.filter(r => r.id !== id && r.name !== id);
+          _saveRoutinesToLocal(uid);
+          _renderRoutinesList();
+          _renderUnifiedProgramsList();
+          if (db && uid && !uid.startsWith('local_')) {
+            deleteDoc(doc(db, 'users', uid, 'routines', id)).catch(err => {
+              console.warn('[activity] Error deleting routine:', err);
+            });
+          }
+        }
+      }
+    });
+  });
+
+  // Beemelés események
+  container.querySelectorAll('.unified-apply-template-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      const item = items[idx];
+      if (!item) return;
+
+      if (item._type === 'protocol') {
+        const uid = _getEffectiveUid();
+        const dateStr = (typeof window.getWhoopDate === 'function' ? window.getWhoopDate() : null) || window._whoopSelectedDate || _selectedDate || todayString();
+        const protoId = 'proto_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+        const recordedProto = {
+          id: protoId,
+          name: item.name,
+          type: item.type || 'smr',
+          category: 'recovery',
+          duration: item.duration || 20,
+          exercises: item.exercises || '',
+          relievedMuscles: item.relievedMuscles || (item.relievedMuscle ? [item.relievedMuscle] : ['all']),
+          relievedMuscle: item.relievedMuscle || 'all',
+          relievedMuscleLabel: item.relievedMuscleLabel || '',
+          date: dateStr,
+          createdAt: new Date().toISOString()
+        };
+        _allProtocols.unshift(recordedProto);
+        _saveProtocolsToLocal(uid);
+
+        btn.innerHTML = '<i class="fa-solid fa-check text-[10px]"></i><span>Sikeresen rögzítve!</span>';
+        setTimeout(() => {
+          _renderUnifiedProgramsList();
+        }, 1200);
+
+        if (db && uid && !uid.startsWith('local_')) {
+          addDoc(collection(db, 'users', uid, 'recoveryProtocols'), {
+            name: item.name,
+            type: item.type || 'smr',
+            category: 'recovery',
+            duration: item.duration || 20,
+            exercises: item.exercises || '',
+            relievedMuscles: recordedProto.relievedMuscles,
+            relievedMuscle: recordedProto.relievedMuscle,
+            relievedMuscleLabel: recordedProto.relievedMuscleLabel,
+            date: dateStr,
+            createdAt: serverTimestamp()
+          }).then(ref => {
+            recordedProto.id = ref.id;
+            _saveProtocolsToLocal(uid);
+          }).catch(err => {
+            console.warn('[activity] Background protocol save warning:', err);
+          });
+        }
+      } else {
+        _closeRoutinesModal();
+        _openWorkoutModal();
+
+        const nameIn = $('wo-input-name');
+        const durIn = $('wo-input-duration');
+        const exIn = $('wo-input-exercises');
+        const sportSel = $('wo-sport-select') || $('wo-select-sport');
+
+        if (nameIn) nameIn.value = item.name;
+        if (durIn) durIn.value = item.duration || 60;
+        if (exIn) exIn.value = item.exercises || '';
+        if (sportSel && item.sportId) {
+          sportSel.value = item.sportId;
+          _selectedSportId = item.sportId;
+          _updateSportUI();
+        }
+
+        if (item.exercises) {
+          const structuredContainer = $('wo-structured-exercises-container');
+          if (structuredContainer) {
+            structuredContainer.innerHTML = '';
+            const lines = item.exercises.split('\n').map(l => l.trim()).filter(Boolean);
+            lines.forEach(line => {
+              const parsed = _parseExerciseLine(line);
+              structuredContainer.appendChild(_createStructuredExerciseStrip(parsed, parsed.isEndurance ? 'endurance' : 'workout'));
+            });
+          }
+        }
+      }
+    });
+  });
+}
+
+function _renderUnifiedExercisesList() {
+  const container = $('unified-exercises-list');
+  if (!container) return;
+
+  const cat = _templateActiveCategory;
+  const deletedExIds = _getDeletedSampleIds('exercises');
+
+  let all = [...DEFAULT_EXERCISES.filter(ex => !deletedExIds.includes(ex.id) && !deletedExIds.includes(ex.name)), ..._allExercises];
+
+  // Kategória szerinti szűrés
+  all = all.filter(ex => _exerciseMatchesCategory(ex, cat));
+
+  // Alkategória szerinti szűrés
+  if (_activeTemplateSubcategory && _activeTemplateSubcategory !== 'all') {
+    all = all.filter(ex => _matchesSubcategory(ex, _activeTemplateSubcategory, cat));
+  }
+
+  // Keresés
+  if (_unifiedExerciseSearchQuery.trim()) {
+    const q = _unifiedExerciseSearchQuery.toLowerCase();
+    all = all.filter(ex =>
+      (ex.name && ex.name.toLowerCase().includes(q)) ||
+      (ex.targetMuscle && ex.targetMuscle.toLowerCase().includes(q)) ||
+      (ex.muscle && ex.muscle.toLowerCase().includes(q)) ||
+      (ex.category && ex.category.toLowerCase().includes(q)) ||
+      (ex.subcategory && ex.subcategory.toLowerCase().includes(q)) ||
+      (ex.notes && ex.notes.toLowerCase().includes(q))
+    );
+  }
+
+  if (all.length === 0) {
+    container.innerHTML = `
+      <div class="text-center py-8 px-4 rounded-2xl bg-gray-50 dark:bg-slate-800/40 border border-dashed border-gray-200 dark:border-slate-700">
+        <i class="fa-solid fa-dumbbell text-2xl text-gray-300 dark:text-gray-600 mb-2"></i>
+        <p class="text-xs font-bold text-gray-600 dark:text-gray-300">Nem található gyakorlat ebben a kategóriában</p>
+        <p class="text-[11px] text-gray-400 mt-1">Kattints a fenti "+ Új gyakorlat" gombra új hozzáadásához!</p>
+      </div>
+    `;
+    return;
+  }
+
+  const html = all.map(ex => {
+    const isCustom = _allExercises.some(ce => ce.id === ex.id);
+    const muscleDisplay = ex.category || 'Általános';
+    const muscleData = '';
+    return `
+      <div class="flex items-start justify-between p-3 rounded-2xl bg-gray-50 dark:bg-slate-800 border border-gray-100 dark:border-slate-700 hover:border-indigo-500/40 transition-colors">
+        <div class="min-w-0 flex-1 mr-2 cursor-pointer unified-ex-item-info" data-name="${ex.name}" data-muscle="${muscleData}" data-category="${ex.category || ''}" data-subcategory="${ex.subcategory || ''}">
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <p class="text-xs font-bold text-gray-900 dark:text-white truncate">${ex.name}</p>
+            ${ex.subcategory ? `<span class="text-[9px] px-1.5 py-0.5 rounded-md font-bold bg-gray-200/60 dark:bg-slate-700 text-gray-600 dark:text-gray-300 border border-gray-200/60 dark:border-slate-700">${ex.subcategory}</span>` : ''}
+          </div>
+          <p class="text-[10px] text-gray-400 font-semibold truncate mt-0.5">${muscleDisplay}</p>
+          ${ex.notes ? `
+            <div class="text-[11px] text-gray-500 dark:text-gray-400 mt-1 flex items-start gap-1 bg-white/70 dark:bg-slate-900/60 p-1.5 rounded-lg border border-gray-100 dark:border-slate-800">
+              <i class="fa-solid fa-circle-info text-indigo-500 dark:text-cyan-400 mt-0.5 text-[10px] flex-shrink-0"></i>
+              <span class="leading-tight">${ex.notes}</span>
+            </div>
+          ` : ''}
+          ${(ex.videoUrl || ex.driveLink) ? `
+            <a href="${ex.videoUrl || ex.driveLink}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-2 py-0.5 mt-1 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 text-[10px] font-bold transition-all active:scale-95" onclick="event.stopPropagation()">
+              <i class="fa-brands fa-google-drive text-[11px]"></i>
+              <span>Videó megnyitása</span>
+              <i class="fa-solid fa-arrow-up-right-from-square text-[8px] ml-0.5"></i>
+            </a>
+          ` : ''}
+        </div>
+        <div class="flex items-center gap-1.5 flex-shrink-0">
+          <span class="text-[9px] px-2 py-0.5 rounded-full font-bold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400">
+            ${ex.category || 'Gyakorlat'}
+          </span>
+          ${isCustom ? `
+            <button type="button" class="unified-edit-single-ex-btn w-6 h-6 rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-gray-600 dark:text-gray-300 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" title="Gyakorlat szerkesztése">
+              <i class="fa-solid fa-pen pointer-events-none"></i>
+            </button>
+            <button type="button" class="unified-del-single-ex-btn w-6 h-6 rounded-lg bg-red-50 hover:bg-red-100 dark:bg-red-950/40 dark:hover:bg-red-900/60 text-red-500 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" data-name="${ex.name}" title="Gyakorlat törlése">
+              <i class="fa-solid fa-trash pointer-events-none"></i>
+            </button>
+          ` : `
+            <button type="button" class="unified-del-single-ex-btn w-6 h-6 rounded-lg bg-gray-100 hover:bg-red-50 dark:bg-slate-700 dark:hover:bg-red-950/40 text-gray-400 hover:text-red-500 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id || ex.name}" data-is-sample="true" data-name="${ex.name}" title="Minta gyakorlat elrejtése">
+              <i class="fa-solid fa-trash pointer-events-none"></i>
+            </button>
+          `}
+          <button type="button" class="unified-insert-single-ex-btn px-2.5 py-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] active:scale-95 transition-all flex items-center gap-1"
+                  data-name="${ex.name}" data-muscle="${muscleData}" data-category="${ex.category || ''}" data-subcategory="${ex.subcategory || ''}">
+            <i class="fa-solid fa-plus text-[9px]"></i>
+            <span>Beszúrás</span>
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = html;
+
+  const insertHandler = (name, muscleHint = '', categoryHint = '', subcategoryHint = '') => {
+    let muscle = 'chest';
+    const n = (name + ' ' + muscleHint).toLowerCase();
+    if (/guggol|squat|láb|leg|comb/i.test(n)) muscle = 'quads';
+    else if (/felhúz|deadlift/i.test(n)) muscle = 'lower_back';
+    else if (/húzódz|pull|evez|lat/i.test(n)) muscle = 'lats';
+    else if (/váll|shoulder|overhead|military/i.test(n)) muscle = 'shoulders';
+    else if (/biceps/i.test(n)) muscle = 'biceps';
+    else if (/triceps/i.test(n)) muscle = 'triceps';
+    else if (/has|abs|crunch|plank/i.test(n)) muscle = 'abs';
+    else if (/vádli|calf/i.test(n)) muscle = 'calves';
+    else if (/hajlító|hamstring|farizom|glute/i.test(n)) muscle = 'hamstrings';
+
+    const routineModal = $('wo-routines-modal');
+    const isRoutineOpen = routineModal && !routineModal.classList.contains('hidden');
+    const protoModal = $('rec-protocols-modal');
+    const isProtoOpen = protoModal && !protoModal.classList.contains('hidden');
+
+    if (isRoutineOpen) {
+      const routineContainer = $('wo-routine-structured-exercises-container');
+      if (routineContainer) {
+        const isEnd = _templateActiveCategory === 'endurance' ||
+          /állóképességi|allokepessegi|endurance|kardió|cardio/i.test(categoryHint) ||
+          _isEnduranceSport($('wo-new-routine-sport')?.value) ||
+          /futás|futópad|kocogás|bringa|kerékpár|országúti|mtb|úszás|evezés|kajak|kenu|sup|kardió|cardio|sprint|gyaloglás|túra|intervallum/i.test(name);
+
+        routineContainer.appendChild(_createStructuredExerciseStrip({
+          name,
+          muscle,
+          category: categoryHint || (isEnd ? 'Állóképességi' : 'Erőfejlesztő'),
+          subcategory: subcategoryHint || '',
+          isEndurance: isEnd,
+          sets: 1,
+          reps: 10,
+          weight: ''
+        }, isEnd ? 'endurance' : 'workout'));
+      }
+      return;
+    }
+
+    if (isProtoOpen) {
+      const protoContainer = $('rec-proto-structured-exercises-container');
+      if (protoContainer) {
+        protoContainer.appendChild(_createStructuredExerciseStrip({
+          name,
+          muscle,
+          sets: 3,
+          reps: 10,
+          weight: ''
+        }, 'recovery'));
+      }
+      return;
+    }
+
+    // Alapértelmezett: Edzés rögzítése (Today's activities / wo-modal)
+    const structuredContainer = $('wo-structured-exercises-container');
+    if (structuredContainer) {
+      structuredContainer.appendChild(_createStructuredExerciseStrip({
+        name,
+        muscle,
+        sets: 4,
+        reps: 10,
+        weight: ''
+      }, 'workout'));
+    }
+
+    const woModal = $('wo-modal');
+    if (woModal && woModal.classList.contains('hidden')) {
+      _openWorkoutModal();
+    }
+  };
+
+  container.querySelectorAll('.unified-insert-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      insertHandler(btn.dataset.name, btn.dataset.muscle, btn.dataset.category, btn.dataset.subcategory);
+    });
+  });
+
+  container.querySelectorAll('.unified-ex-item-info').forEach(info => {
+    info.addEventListener('click', () => {
+      insertHandler(info.dataset.name, info.dataset.muscle, info.dataset.category, info.dataset.subcategory);
+    });
+  });
+
+  container.querySelectorAll('.unified-del-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const isSample = btn.dataset.isSample === 'true';
+      const name = btn.dataset.name || 'gyakorlatot';
+
+      if (isSample) {
+        if (!confirm(`Biztosan elrejted ezt a minta gyakorlatot?`)) return;
+        _markSampleDeleted('exercises', id);
+        _renderUnifiedExercisesList();
+        return;
+      }
+      if (id) {
+        const uid = _getEffectiveUid();
+        if (!confirm(`Biztosan törlöd a(z) "${name}" gyakorlatot a könyvtáradból?`)) return;
+        _allExercises = _allExercises.filter(ex => ex.id !== id && ex.name !== id);
+        _saveExercisesToLocal(uid);
+        _renderExercisesList();
+        _renderUnifiedExercisesList();
+        if (db && uid && !uid.startsWith('local_')) {
+          deleteDoc(doc(db, 'users', uid, 'exercises', id)).catch(err => {
+            console.warn('[activity] Error deleting exercise:', err);
+          });
+        }
+      }
+    });
+  });
+
+  container.querySelectorAll('.unified-edit-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const ex = _allExercises.find(x => x.id === id);
+      if (!ex) return;
+      _openExercisesModal();
+      _startEditingExercise(ex);
+    });
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// RUTINOK ÉS GYAKORLATTÁR
+// ══════════════════════════════════════════════════════════════
+
+function _openRoutinesModal() {
+  const modal = $('wo-routines-modal');
+  const sheet = $('wo-routines-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = '';
+  _populateSportDropdown();
+  _renderRoutinesList();
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+      const nameIn = $('wo-new-routine-name');
+      if (nameIn) {
+        setTimeout(() => {
+          nameIn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          nameIn.focus();
+        }, 300);
+      }
+    });
+  });
+}
+
+function _closeRoutinesModal() {
+  const modal = $('wo-routines-modal');
+  const sheet = $('wo-routines-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = 'none';
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    modal.style.pointerEvents = '';
+  }, 340);
+}
+
+function _renderRoutinesList() {
+  const containers = [$('wo-routines-list'), $('wo-routines-modal-list')].filter(Boolean);
+  if (containers.length === 0) return;
+
+  const deletedSampleIds = _getDeletedSampleIds('routines');
+  const activeDefaultRoutines = (DEFAULT_ROUTINES || []).filter(r => !deletedSampleIds.includes(r.id) && !deletedSampleIds.includes(r.name));
+  const all = [...activeDefaultRoutines, ..._allRoutines];
+
+  if (all.length === 0) {
+    const emptyHtml = `<p class="text-xs text-gray-400 text-center py-6">Nincs elérhető edzésprogram.</p>`;
+    containers.forEach(c => { c.innerHTML = emptyHtml; });
+    return;
+  }
+
+  const html = all.map((r, idx) => {
+    const isCustom = Boolean(r.id && !r.isSample);
+    const sport = getSportById(r.sportId || 'strength_training');
+    return `
+      <div class="p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <div class="w-8 h-8 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-500 flex items-center justify-center text-xs">
+              <i class="${sport.icon || 'fa-solid fa-dumbbell'}"></i>
+            </div>
+            <div>
+              <h4 class="text-xs font-bold text-gray-900 dark:text-white">${r.name}</h4>
+              <p class="text-[10px] text-gray-400">${r.duration || 60} perc · ${sport.name}</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${isCustom ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 dark:bg-slate-800 text-gray-500'}">
+              ${isCustom ? 'Saját' : 'Minta'}
+            </span>
+            ${isCustom ? `
+              <button class="wo-delete-routine-btn text-gray-300 hover:text-red-500 p-1 transition-colors" data-id="${r.id}" data-name="${_esc(r.name)}" title="Program törlése">
+                <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+              </button>
+            ` : `
+              <button class="wo-delete-routine-btn text-gray-300 hover:text-red-500 p-1 transition-colors" data-id="${r.id || r.name}" data-name="${_esc(r.name)}" data-is-sample="true" title="Minta program törlése">
+                <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+              </button>
+            `}
+          </div>
+        </div>
+
+        <div class="p-3 rounded-2xl bg-gray-50 dark:bg-slate-800/60 font-mono text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-line leading-relaxed mb-3">
+          ${r.exercises || ''}
+        </div>
+
+        <button class="wo-apply-routine-btn w-full py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs active:scale-95 transition-all flex items-center justify-center gap-1.5"
+                data-idx="${idx}">
+          <i class="fa-solid fa-plus text-[10px]"></i>
+          <span>Beemelés a mai edzésbe</span>
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  containers.forEach(container => {
+    container.innerHTML = html;
+
+    container.querySelectorAll('.wo-apply-routine-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.idx, 10);
+        const routine = all[idx];
+        if (!routine) return;
+
+        _closeRoutinesModal();
+        _openWorkoutModal();
+
+        const nameIn = $('wo-input-name');
+        const durIn = $('wo-input-duration');
+        const exIn = $('wo-input-exercises');
+        const sportSel = $('wo-sport-select') || $('wo-select-sport');
+
+        if (nameIn) nameIn.value = routine.name;
+        if (durIn) durIn.value = routine.duration || 60;
+        if (exIn) exIn.value = routine.exercises || '';
+        if (sportSel && routine.sportId) {
+          sportSel.value = routine.sportId;
+          _selectedSportId = routine.sportId;
+          _updateSportUI();
+        }
+
+        // Strukturált rubrikás gyakorlatsorok feltöltése
+        if (routine.exercises) {
+          const structuredContainer = $('wo-structured-exercises-container');
+          if (structuredContainer) {
+            structuredContainer.innerHTML = '';
+            const lines = routine.exercises.split('\n').map(l => l.trim()).filter(Boolean);
+            lines.forEach(line => {
+              const parsed = _parseExerciseLine(line);
+              structuredContainer.appendChild(_createStructuredExerciseStrip(parsed, parsed.isEndurance ? 'endurance' : 'workout'));
+            });
+          }
+        }
+      });
+    });
+
+    container.querySelectorAll('.wo-delete-routine-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        const isSample = btn.dataset.isSample === 'true';
+        const name = btn.dataset.name || 'edzéssablont';
+        if (isSample) {
+          if (!confirm(`Biztosan elrejted a(z) "${name}" minta sablont?`)) return;
+          _markSampleDeleted('routines', id);
+          _renderRoutinesList();
+          return;
+        }
+        if (id) {
+          const uid = _getEffectiveUid();
+          if (!confirm(`Biztosan törlöd a(z) "${name}" edzéssablont a sablonok közül?`)) return;
+          _allRoutines = _allRoutines.filter(r => r.id !== id && r.name !== id);
+          _saveRoutinesToLocal(uid);
+          _renderRoutinesList();
+          _renderUnifiedProgramsList();
+          if (db && uid && !uid.startsWith('local_')) {
+            deleteDoc(doc(db, 'users', uid, 'routines', id)).catch(err => {
+              console.warn('[activity] Error deleting routine:', err);
+            });
+          }
+        }
+      });
+    });
+  });
+}
+
+async function _saveRoutine() {
+  const uid = _getEffectiveUid();
+  const nameIn = $('wo-new-routine-name') || $('wo-routine-name-in');
+  const durIn = $('wo-new-routine-duration') || $('wo-routine-dur-in');
+  const exIn = $('wo-new-routine-exercises') || $('wo-routine-exercises-in');
+  const notesIn = $('wo-routine-notes-in');
+  const sportSel = $('wo-new-routine-sport');
+  const container = $('wo-routine-structured-exercises-container');
+  const subcatIn = $('wo-new-routine-subcat');
+
+  const name = nameIn?.value.trim();
+  if (!name) {
+    alert('Kérlek add meg az edzéssablon nevét!');
+    nameIn?.focus();
+    return;
+  }
+
+  const subcategory = subcatIn?.value.trim() || '';
+  const exerciseLines = [];
+  if (container) {
+    container.querySelectorAll('.wo-structured-ex-row').forEach(row => {
+      const exName = row.dataset.name || row.querySelector('.wo-ex-name-display')?.textContent.trim() || 'Gyakorlat';
+      const isEnduranceRow = row.dataset.exerciseType === 'endurance';
+
+      if (isEnduranceRow) {
+        const measureMode = row.dataset.measureMode || 'distance';
+        const measureIn = row.querySelector('.wo-ex-measure-val');
+        const defaultVal = measureMode === 'time' ? '30' : '5';
+        const measureVal = measureIn?.value.trim() || defaultVal;
+        const measureUnit = row.querySelector('.wo-ex-measure-unit')?.textContent.trim() || (measureMode === 'time' ? 'perc' : 'km');
+
+        const targetMode = row.dataset.targetMode || 'zone';
+        let targetStr = '';
+        if (targetMode === 'zone') {
+          const zone = row.dataset.selectedZone || '2';
+          targetStr = `Zóna ${zone}`;
+        } else {
+          const paceIn = row.querySelector('.wo-ex-pace-val');
+          const paceVal = paceIn?.value.trim() || '5:00';
+          targetStr = `Tempó: ${paceVal}/km`;
+        }
+
+        exerciseLines.push(`${exName}: ${measureVal} ${measureUnit}${targetStr ? ` (${targetStr})` : ''}`);
+      } else {
+        const sets = parseInt(row.querySelector('.wo-ex-sets')?.value, 10) || 1;
+        const reps = parseInt(row.querySelector('.wo-ex-reps')?.value, 10) || 1;
+        const weightVal = row.querySelector('.wo-ex-weight')?.value.trim();
+        const weight = weightVal ? parseFloat(weightVal) : null;
+        exerciseLines.push(`${exName}: ${sets} × ${reps}${weight ? ` (${weight} kg)` : ''}`);
+      }
+    });
+  }
+
+  let exercises = exerciseLines.join('\n');
+  if (!exercises && exIn?.value.trim()) {
+    exercises = exIn.value.trim();
+  }
+
+  const routineId = 'rt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  const sportId = sportSel?.value || 'strength_training';
+  const duration = parseInt(durIn?.value, 10) || 60;
+  const notes = notesIn?.value.trim() || '';
+
+  const category = _templateActiveCategory || 'strength';
+  const localRoutine = {
+    id: routineId,
+    name,
+    sportId,
+    duration,
+    exercises,
+    subcategory,
+    category,
+    notes,
+    createdAt: new Date().toISOString()
+  };
+
+  // 1. Azonnali helyi mentés és renderelés
+  _allRoutines.unshift(localRoutine);
+  _saveRoutinesToLocal(uid);
+
+  // 2. Űrlap és modál reset
+  if (nameIn) nameIn.value = '';
+  if (exIn) exIn.value = '';
+  if (notesIn) notesIn.value = '';
+  if (subcatIn) subcatIn.value = '';
+  if (container) container.innerHTML = '';
+  _closeRoutinesModal();
+  _renderRoutinesList();
+  _renderUnifiedProgramsList();
+
+  // 3. Háttérben aszinkron mentés
+  if (db && uid && !uid.startsWith('local_')) {
+    addDoc(collection(db, 'users', uid, 'routines'), {
+      name,
+      sportId,
+      duration,
+      exercises,
+      subcategory,
+      category,
+      notes,
+      createdAt: serverTimestamp()
+    }).then(ref => {
+      const item = _allRoutines.find(x => x.id === routineId);
+      if (item) {
+        item.id = ref.id;
+        _saveRoutinesToLocal(uid);
+      }
+    }).catch(err => {
+      console.warn('[activity] Routine save error:', err);
+    });
+  }
+}
+
+// ── Gyakorlattár ──────────────────────────────────────────
+function _updateMultiSelectUI() {
+  const bar = $('wo-ex-multiselect-bar');
+  const countBadge = $('wo-ex-selected-count-badge');
+  const addBtn = $('wo-ex-add-multiselected-btn');
+  const btnText = $('wo-ex-multiselect-btn-text');
+  const toggleBtn = $('wo-ex-toggle-multiselect-btn');
+
+  const count = _selectedExercisesForBatch ? _selectedExercisesForBatch.size : 0;
+  if (countBadge) countBadge.textContent = String(count);
+  if (addBtn) {
+    addBtn.disabled = count === 0;
+    addBtn.classList.toggle('opacity-50', count === 0);
+  }
+
+  if (_isExerciseMultiSelectMode) {
+    if (bar) bar.classList.remove('hidden');
+    if (toggleBtn) {
+      toggleBtn.classList.remove('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+      toggleBtn.classList.add('bg-indigo-600', 'text-white', 'border-indigo-600');
+    }
+    if (btnText) btnText.textContent = 'Mégse';
+  } else {
+    if (bar) bar.classList.add('hidden');
+    if (toggleBtn) {
+      toggleBtn.classList.add('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+      toggleBtn.classList.remove('bg-indigo-600', 'text-white', 'border-indigo-600');
+    }
+    if (btnText) btnText.textContent = 'Kijelölés';
+  }
+}
+
+function _openExercisesModal() {
+  const modal = $('wo-exercises-modal');
+  const sheet = $('wo-exercises-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = '';
+  _updateExerciseSubcatDropdown();
+  _updateSubcategoryDatalists();
+  _updateMultiSelectUI();
+  _renderExercisesList();
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+
+function _closeExercisesModal() {
+  const modal = $('wo-exercises-modal');
+  const sheet = $('wo-exercises-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = 'none';
+  _isExerciseMultiSelectMode = false;
+  _selectedExercisesForBatch.clear();
+  _updateMultiSelectUI();
+  _activeExerciseTarget = null;
+  if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    modal.style.pointerEvents = '';
+  }, 340);
+}
+
+if (typeof window !== 'undefined') {
+  window._openExercisesModal = _openExercisesModal;
+  window._closeExercisesModal = _closeExercisesModal;
+}
+
+let _activeExerciseCategory = 'all';
+let _exerciseSearchQuery = '';
+
+const MUSCLE_KEY_NAMES = {
+  quads: 'Combfeszítő (Quads)',
+  hamstrings: 'Combhajlító (Hamstrings)',
+  glutes: 'Farizom (Glutes)',
+  calves: 'Vádli (Calves)',
+  adductors: 'Belső comb',
+  chest: 'Mellkas (Chest)',
+  shoulders: 'Vállak (Deltoids)',
+  biceps: 'Bicepsz (Biceps)',
+  triceps: 'Tricepsz (Triceps)',
+  forearms: 'Alkar (Forearms)',
+  lats: 'Széles hátizom (Lats)',
+  traps: 'Trapézizom (Traps)',
+  lower_back: 'Alsó hát / Derék',
+  abs: 'Hasizom (Abs)',
+  obliques: 'Ferde hasizom',
+  neck: 'Nyak',
+  all: 'Teljes test'
+};
+
+function _insertExerciseToActiveTarget(name, muscleHint = '', keepModalOpen = false, categoryHint = '') {
+  let muscle = 'chest';
+  const n = (name + ' ' + muscleHint).toLowerCase();
+  if (/guggol|squat|láb|leg|comb/i.test(n)) muscle = 'quads';
+  else if (/felhúz|deadlift/i.test(n)) muscle = 'lower_back';
+  else if (/húzódz|pull|evez|lat/i.test(n)) muscle = 'lats';
+  else if (/váll|shoulder|overhead|military|oldalemel|lateral/i.test(n)) muscle = 'shoulders';
+  else if (/biceps/i.test(n)) muscle = 'biceps';
+  else if (/triceps/i.test(n)) muscle = 'triceps';
+  else if (/has|abs|crunch|plank/i.test(n)) muscle = 'abs';
+  else if (/vádli|calf/i.test(n)) muscle = 'calves';
+  else if (/hajlító|hamstring|farizom|glute/i.test(n)) muscle = 'hamstrings';
+
+  const routineModal = $('wo-routines-modal');
+  const isRoutineOpen = routineModal && !routineModal.classList.contains('hidden');
+  const protoModal = $('rec-protocols-modal');
+  const isProtoOpen = protoModal && !protoModal.classList.contains('hidden');
+  const detailModal = $('wo-detail-modal');
+  const isDetailOpen = detailModal && !detailModal.classList.contains('hidden');
+
+  if (isRoutineOpen || _activeExerciseTarget === 'routine') {
+    const routineContainer = $('wo-routine-structured-exercises-container');
+    if (routineContainer) {
+      const isEnd = _templateActiveCategory === 'endurance' ||
+        /állóképességi|allokepessegi|endurance|kardió|cardio/i.test(categoryHint || muscleHint) ||
+        _isEnduranceSport($('wo-new-routine-sport')?.value) ||
+        /futás|futópad|kocogás|bringa|kerékpár|országúti|mtb|úszás|evezés|kajak|kenu|sup|kardió|cardio|sprint|gyaloglás|túra|intervallum/i.test(name);
+
+      routineContainer.appendChild(_createStructuredExerciseStrip({
+        name,
+        muscle,
+        category: categoryHint || (isEnd ? 'Állóképességi' : 'Erőfejlesztő'),
+        subcategory: '',
+        isEndurance: isEnd,
+        sets: 1,
+        reps: 10,
+        weight: ''
+      }, isEnd ? 'endurance' : 'workout'));
+    }
+    if (!keepModalOpen) {
+      _activeExerciseTarget = null;
+      if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+      _closeExercisesModal();
+    }
+    return;
+  }
+
+  if (isProtoOpen || _activeExerciseTarget === 'recovery') {
+    const protoContainer = $('rec-proto-structured-exercises-container');
+    if (protoContainer) {
+      protoContainer.appendChild(_createStructuredExerciseStrip({
+        name,
+        muscle,
+        sets: 3,
+        reps: 10,
+        weight: ''
+      }, 'recovery'));
+    }
+    if (!keepModalOpen) {
+      _activeExerciseTarget = null;
+      if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+      _closeExercisesModal();
+    }
+    return;
+  }
+
+  if (isDetailOpen && (window._activeExerciseTarget === 'detail' || _activeExerciseTarget === 'detail' || !$('wo-structured-exercises-container'))) {
+    const detailContainer = $('wo-detail-exercises-container');
+    if (detailContainer) {
+      if (typeof window._createDetailExerciseRow === 'function') {
+        detailContainer.appendChild(window._createDetailExerciseRow({
+          name,
+          muscle,
+          sets: 4,
+          reps: 10,
+          weight: ''
+        }));
+      } else {
+        const row = document.createElement('div');
+        const escName = (name || 'Gyakorlat').replace(/"/g, '&quot;');
+        row.className = 'wo-structured-ex-row p-2.5 sm:p-3 rounded-2xl bg-white dark:bg-[#181A20] border border-gray-200 dark:border-[#2A2C34] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 transition-all';
+        row.dataset.name = name;
+        row.dataset.muscle = muscle;
+        row.innerHTML = `
+          <div class="flex items-center justify-between sm:justify-start gap-2.5 min-w-0 flex-1">
+            <div class="w-8 h-8 rounded-xl bg-cyan-500/15 text-[#00E5FF] flex items-center justify-center text-xs flex-shrink-0">
+              <i class="fa-solid fa-dumbbell"></i>
+            </div>
+            <div class="min-w-0 flex-1">
+              <h5 class="wo-ex-name-display text-xs sm:text-sm font-bold text-gray-900 dark:text-white truncate" title="${escName}">${escName}</h5>
+              <p class="text-[10px] text-gray-400 font-medium truncate">Gyakorlat</p>
+            </div>
+            <button type="button" class="wo-remove-ex-row-btn sm:hidden w-7 h-7 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-500/10 flex items-center justify-center transition-colors" title="Eltávolítás">
+              <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+            </button>
+          </div>
+          <div class="flex items-center gap-2 justify-end flex-shrink-0">
+            <div class="flex items-center gap-1 bg-gray-50 dark:bg-[#121316] px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-[#2A2C34]">
+              <input type="number" step="0.5" min="0" placeholder="—" value=""
+                     class="wo-ex-weight w-12 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Súly (kg)" />
+              <span class="text-[10px] text-gray-400 font-bold select-none">kg</span>
+            </div>
+            <div class="flex items-center gap-1 bg-gray-50 dark:bg-[#121316] px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-[#2A2C34]">
+              <input type="number" min="1" max="99" value="4"
+                     class="wo-ex-sets w-8 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Sorozatok száma" />
+              <span class="text-[10px] text-gray-400 font-bold select-none">sor.</span>
+            </div>
+            <div class="flex items-center gap-1 bg-gray-50 dark:bg-[#121316] px-2.5 py-1.5 rounded-xl border border-gray-200 dark:border-[#2A2C34]">
+              <input type="number" min="1" max="999" value="10"
+                     class="wo-ex-reps w-10 text-center text-xs font-bold text-gray-900 dark:text-white bg-transparent focus:outline-none" title="Ismétlések száma" />
+              <span class="text-[10px] text-gray-400 font-bold select-none">ism.</span>
+            </div>
+            <button type="button" class="wo-remove-ex-row-btn hidden sm:flex w-7 h-7 rounded-xl text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 items-center justify-center transition-colors" title="Eltávolítás">
+              <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+            </button>
+          </div>
+        `;
+        row.querySelectorAll('.wo-remove-ex-row-btn').forEach(btn => btn.onclick = () => row.remove());
+        detailContainer.appendChild(row);
+      }
+    }
+    if (!keepModalOpen) {
+      _activeExerciseTarget = null;
+      if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+      _closeExercisesModal();
+    }
+    return;
+  }
+
+  // Alapértelmezett: Edzés rögzítése (Today's activities / wo-modal)
+  const structuredContainer = $('wo-structured-exercises-container');
+  if (structuredContainer) {
+    structuredContainer.appendChild(_createStructuredExerciseStrip({
+      name,
+      muscle,
+      sets: 4,
+      reps: 10,
+      weight: ''
+    }, 'workout'));
+  }
+
+  if (!keepModalOpen) {
+    _activeExerciseTarget = null;
+    if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+    _closeExercisesModal();
+    const woModal = $('wo-modal');
+    if (woModal && woModal.classList.contains('hidden')) {
+      _openWorkoutModal();
+    }
+  }
+}
+
+function _renderExercisesList() {
+  const container = $('wo-exercises-items') || $('wo-exercises-list');
+  if (!container) return;
+
+  let all = [...DEFAULT_EXERCISES, ..._allExercises];
+  const knownNames = new Set(all.map(e => (e.name || '').toLowerCase().trim()));
+  if (Array.isArray(_allWorkouts)) {
+    _allWorkouts.forEach(w => {
+      if (Array.isArray(w.exerciseItems)) {
+        w.exerciseItems.forEach(item => {
+          const itemTrimmed = (item?.name || '').trim();
+          if (itemTrimmed && !knownNames.has(itemTrimmed.toLowerCase())) {
+            knownNames.add(itemTrimmed.toLowerCase());
+            all.push({
+              id: 'prev_wo_ex_' + itemTrimmed,
+              name: itemTrimmed,
+              category: 'Korábbi edzésből',
+              targetMuscle: MUSCLE_KEY_NAMES[item.muscle] || 'Egyéni'
+            });
+          }
+        });
+      }
+    });
+  }
+
+  if (_activeExerciseCategory !== 'all') {
+    all = all.filter(ex => {
+      const activeCatKey = _getCategoryKey(_activeExerciseCategory);
+      const exCatKey = _getCategoryKey(ex.category || ex.mainCategory || '');
+      return activeCatKey === exCatKey || (ex.category || '').toLowerCase() === _activeExerciseCategory.toLowerCase();
+    });
+  }
+
+  if (_exerciseSearchQuery.trim()) {
+    const q = _exerciseSearchQuery.toLowerCase();
+    all = all.filter(ex =>
+      (ex.name && ex.name.toLowerCase().includes(q)) ||
+      (ex.targetMuscle && ex.targetMuscle.toLowerCase().includes(q)) ||
+      (ex.muscle && ex.muscle.toLowerCase().includes(q))
+    );
+  }
+
+  if (all.length === 0) {
+    container.innerHTML = `
+      <p class="text-xs text-gray-400 italic text-center py-4">Nem található ilyen gyakorlat.</p>
+    `;
+    return;
+  }
+
+  container.innerHTML = all.map(ex => {
+    const isCustom = _allExercises.some(ce => ce.id === ex.id);
+    const muscleDisplay = ex.category || 'Általános';
+    const muscleData = ex.muscle || ex.targetMuscle || ex.category || '';
+    const key = ex.id || ex.name;
+    const isSelected = _selectedExercisesForBatch.has(key);
+    const hasNotes = Boolean(ex.notes && ex.notes.trim());
+    const hasVideo = Boolean(ex.videoUrl && ex.videoUrl.trim());
+    const cardBorderClass = isSelected
+      ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/40 ring-1 ring-indigo-500'
+      : 'border-gray-100 dark:border-slate-700 bg-gray-50 dark:bg-slate-800 hover:border-indigo-500/40';
+
+    return `
+      <div class="wo-ex-item-card flex items-start justify-between p-3 rounded-2xl ${cardBorderClass} transition-all cursor-pointer"
+           data-key="${key}" data-name="${_esc(ex.name)}" data-muscle="${_esc(muscleData)}" data-category="${_esc(ex.category || '')}">
+        <div class="flex items-start gap-2.5 min-w-0 flex-1 mr-2">
+          ${_isExerciseMultiSelectMode ? `
+            <div class="wo-ex-multiselect-checkbox mt-0.5 w-5 h-5 rounded-lg flex items-center justify-center text-xs flex-shrink-0 transition-all ${isSelected ? 'bg-indigo-600 text-white' : 'border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900'}">
+              ${isSelected ? '<i class="fa-solid fa-check text-[10px]"></i>' : ''}
+            </div>
+          ` : ''}
+          <div class="min-w-0 flex-1 wo-ex-item-info">
+            <p class="text-xs font-bold text-gray-900 dark:text-white truncate">${_esc(ex.name)}</p>
+            <div class="flex items-center gap-1.5 flex-wrap mt-0.5">
+              <span class="text-[10px] text-gray-400 font-semibold truncate">${_esc(muscleDisplay)}</span>
+              ${ex.subcategory ? `
+                <span class="text-[9px] px-1.5 py-0.2 rounded-md font-medium bg-gray-200/60 dark:bg-slate-700 text-gray-600 dark:text-gray-300">
+                  ${_esc(ex.subcategory)}
+                </span>
+              ` : ''}
+            </div>
+            ${hasNotes ? `
+              <p class="text-[10px] text-gray-500 dark:text-gray-400 italic mt-1 line-clamp-2">
+                <i class="fa-regular fa-note-sticky text-[9px] mr-1 text-indigo-400"></i>${_esc(ex.notes)}
+              </p>
+            ` : ''}
+            ${hasVideo ? `
+              <div class="mt-1">
+                <a href="${_esc(ex.videoUrl)}" target="_blank" rel="noopener noreferrer"
+                   class="wo-ex-video-link inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 text-[10px] font-bold hover:bg-indigo-100 transition-colors"
+                   onclick="event.stopPropagation()">
+                  <i class="fa-solid fa-circle-play text-[10px]"></i>
+                  <span>Gyakorlat videó</span>
+                </a>
+              </div>
+            ` : ''}
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5 flex-shrink-0 mt-0.5">
+          <span class="text-[9px] px-2 py-0.5 rounded-full font-bold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400">
+            ${_esc(ex.category || 'Gyakorlat')}
+          </span>
+          ${isCustom ? `
+            <button type="button" class="wo-edit-single-ex-btn w-6 h-6 rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-gray-600 dark:text-gray-300 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" title="Gyakorlat szerkesztése">
+              <i class="fa-solid fa-pen pointer-events-none"></i>
+            </button>
+            <button type="button" class="wo-del-single-ex-btn w-6 h-6 rounded-lg bg-red-50 hover:bg-red-100 dark:bg-red-950/40 dark:hover:bg-red-900/60 text-red-500 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" data-name="${_esc(ex.name)}" title="Gyakorlat törlése">
+              <i class="fa-solid fa-trash pointer-events-none"></i>
+            </button>
+          ` : ''}
+          ${!_isExerciseMultiSelectMode ? `
+            <button type="button" class="wo-insert-single-ex-btn px-2.5 py-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] active:scale-95 transition-all flex items-center gap-1"
+                    data-name="${_esc(ex.name)}" data-muscle="${_esc(muscleData)}" data-category="${_esc(ex.category || '')}">
+              <i class="fa-solid fa-plus text-[9px]"></i>
+              <span>Beszúrás</span>
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // Kártya és gombok eseménykezelése
+  container.querySelectorAll('.wo-ex-item-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('button') || e.target.closest('a')) return;
+
+      const key = card.dataset.key;
+      const name = card.dataset.name;
+      const muscle = card.dataset.muscle;
+      const category = card.dataset.category;
+
+      if (_isExerciseMultiSelectMode) {
+        if (_selectedExercisesForBatch.has(key)) {
+          _selectedExercisesForBatch.delete(key);
+        } else {
+          _selectedExercisesForBatch.set(key, { id: key, name, muscle, category });
+        }
+        _updateMultiSelectUI();
+        _renderExercisesList();
+      } else {
+        _insertExerciseToActiveTarget(name, muscle, false, category);
+      }
+    });
+  });
+
+  container.querySelectorAll('.wo-insert-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _insertExerciseToActiveTarget(btn.dataset.name, btn.dataset.muscle, false, btn.dataset.category);
+    });
+  });
+
+  container.querySelectorAll('.wo-edit-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const ex = _allExercises.find(x => x.id === id);
+      if (ex) _startEditingExercise(ex);
+    });
+  });
+
+  container.querySelectorAll('.wo-del-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const name = btn.dataset.name || 'gyakorlatot';
+      if (!id) return;
+      const uid = _getEffectiveUid();
+      if (!confirm(`Biztosan törlöd a(z) "${name}" gyakorlatot a könyvtáradból?`)) return;
+      _allExercises = _allExercises.filter(ex => ex.id !== id && ex.name !== id);
+      _saveExercisesToLocal(uid);
+      _renderExercisesList();
+      if (typeof _renderUnifiedExercisesList === 'function') _renderUnifiedExercisesList();
+      if (db && uid && !uid.startsWith('local_')) {
+        deleteDoc(doc(db, 'users', uid, 'exercises', id)).catch(err => {
+          console.warn('[activity] Error deleting exercise:', err);
+        });
+      }
+    });
+  });
+}
+
+function _startEditingExercise(ex) {
+  const nameIn = $('wo-new-ex-name');
+  const catIn = $('wo-new-ex-cat');
+  const subcatIn = $('wo-new-ex-subcat');
+  const muscleIn = $('wo-new-ex-muscle');
+  const notesIn = $('wo-new-ex-notes');
+  const videoIn = $('wo-new-ex-video');
+  const editIdIn = $('wo-edit-ex-id');
+  const saveBtn = $('wo-save-new-ex-btn');
+  const titleEl = $('wo-new-ex-title');
+  const cancelBtn = $('wo-cancel-edit-ex-btn');
+
+  if (nameIn) nameIn.value = ex.name || '';
+  if (catIn) {
+    catIn.value = _getCategoryLabel(ex.category || ex.mainCategory || 'Erőfejlesztő');
+  }
+  _updateExerciseSubcatDropdown(ex.subcategory || '');
+  if (muscleIn) {
+    const mKey = ex.muscleKey || (ex.targetMuscles && ex.targetMuscles[0]) || (ex.relievedMuscles && ex.relievedMuscles[0]);
+    if (mKey) muscleIn.value = mKey;
+  }
+  if (notesIn) notesIn.value = ex.notes || '';
+  if (videoIn) videoIn.value = ex.videoUrl || ex.video || '';
+  if (editIdIn) editIdIn.value = ex.id;
+  if (saveBtn) saveBtn.textContent = 'Módosítások mentése';
+  if (titleEl) titleEl.textContent = 'Gyakorlat szerkesztése';
+  if (cancelBtn) cancelBtn.classList.remove('hidden');
+
+  nameIn?.focus();
+  nameIn?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function _resetExerciseForm() {
+  const nameIn = $('wo-new-ex-name');
+  const catIn = $('wo-new-ex-cat');
+  const subcatIn = $('wo-new-ex-subcat');
+  const muscleIn = $('wo-new-ex-muscle');
+  const notesIn = $('wo-new-ex-notes');
+  const videoIn = $('wo-new-ex-video');
+  const editIdIn = $('wo-edit-ex-id');
+  const saveBtn = $('wo-save-new-ex-btn');
+  const titleEl = $('wo-new-ex-title');
+  const cancelBtn = $('wo-cancel-edit-ex-btn');
+
+  if (nameIn) nameIn.value = '';
+  if (catIn) {
+    if (_templateActiveCategory === 'endurance') catIn.value = 'Állóképességi';
+    else if (_templateActiveCategory === 'recovery') catIn.value = 'Regeneráció';
+    else catIn.value = 'Erőfejlesztő';
+  }
+  _updateExerciseSubcatDropdown('');
+  if (muscleIn) muscleIn.value = 'quads';
+  if (notesIn) notesIn.value = '';
+  if (videoIn) videoIn.value = '';
+  if (editIdIn) editIdIn.value = '';
+  if (saveBtn) saveBtn.textContent = 'Gyakorlat mentése a könyvtárba';
+  if (titleEl) titleEl.textContent = '+ Új egyéni gyakorlat hozzáadása a könyvtárhoz';
+  if (cancelBtn) cancelBtn.classList.add('hidden');
+}
+
+async function _saveCustomExercise() {
+  const uid = _getEffectiveUid();
+  const nameIn = $('wo-new-ex-name');
+  const catIn = $('wo-new-ex-cat');
+  const subcatIn = $('wo-new-ex-subcat');
+  const muscleIn = $('wo-new-ex-muscle');
+  const notesIn = $('wo-new-ex-notes');
+  const videoIn = $('wo-new-ex-video');
+  const editIdIn = $('wo-edit-ex-id');
+  const name = nameIn?.value.trim();
+  if (!name) {
+    alert('Kérlek add meg a gyakorlat nevét!');
+    nameIn?.focus();
+    return;
+  }
+
+  const category = catIn?.value || 'Erőfejlesztő';
+  const subcategory = subcatIn?.value.trim() || '';
+  const notes = notesIn?.value.trim() || '';
+  const videoUrl = videoIn?.value.trim() || '';
+  const muscleKey = muscleIn?.value || 'quads';
+  const muscleLabel = MUSCLE_KEY_NAMES[muscleKey] || muscleKey;
+  const isRelief = /smr|nyújt|stretch|mobilit|légzés|hideg|regener/i.test(category);
+
+  const editId = editIdIn?.value;
+  const exId = editId || ('ex_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7));
+
+  const mainCat = _getCategoryKey(category);
+  const localExItem = {
+    id: exId,
+    name,
+    category,
+    subcategory,
+    notes,
+    videoUrl,
+    muscle: muscleLabel,
+    targetMuscle: !isRelief ? muscleLabel : '',
+    targetMuscles: !isRelief ? [muscleKey] : [],
+    relievedMuscle: isRelief ? muscleLabel : '',
+    relievedMuscles: isRelief ? [muscleKey] : [],
+    muscleKey,
+    mainCategory: mainCat,
+    createdAt: new Date().toISOString()
+  };
+
+  // 1. Azonnali helyi mentés
+  if (editId) {
+    const idx = _allExercises.findIndex(x => x.id === editId);
+    if (idx !== -1) {
+      _allExercises[idx] = { ..._allExercises[idx], ...localExItem };
+    } else {
+      _allExercises.unshift(localExItem);
+    }
+  } else {
+    _allExercises = _allExercises.filter(x => x.id !== exId);
+    _allExercises.unshift(localExItem);
+  }
+  _saveExercisesToLocal(uid);
+
+  // 2. Ha edzéssablon (rutin), regeneráció vagy edzésrészletező nyitva van, szalag beszúrása
+  const routineModal = $('wo-routines-modal');
+  const isRoutineOpen = routineModal && !routineModal.classList.contains('hidden');
+  const protoModal = $('rec-protocols-modal');
+  const isProtoOpen = protoModal && !protoModal.classList.contains('hidden');
+  const detailModal = $('wo-detail-modal');
+  const isDetailOpen = detailModal && !detailModal.classList.contains('hidden');
+
+  if (isRoutineOpen || _activeExerciseTarget === 'routine') {
+    const routineContainer = $('wo-routine-structured-exercises-container');
+    if (routineContainer) {
+      const isEnd = _templateActiveCategory === 'endurance' ||
+        (catIn && /állóképességi|endurance|kardió/i.test(catIn.value)) ||
+        _isEnduranceSport($('wo-new-routine-sport')?.value) ||
+        /futás|futópad|kocogás|bringa|kerékpár|országúti|mtb|úszás|evezés|kajak|kenu|sup|kardió|cardio|sprint|gyaloglás|túra|intervallum/i.test(name);
+
+      routineContainer.appendChild(_createStructuredExerciseStrip({
+        name,
+        muscle: muscleKey,
+        category: isEnd ? 'Állóképességi' : 'Erőfejlesztő',
+        subcategory: subcatIn?.value || '',
+        isEndurance: isEnd,
+        sets: 1,
+        reps: 10,
+        weight: ''
+      }, isEnd ? 'endurance' : 'workout'));
+    }
+  } else if (isProtoOpen || _activeExerciseTarget === 'recovery') {
+    const protoContainer = $('rec-proto-structured-exercises-container');
+    if (protoContainer) {
+      protoContainer.appendChild(_createStructuredExerciseStrip({
+        name,
+        muscle: muscleKey,
+        sets: 3,
+        reps: 10,
+        weight: ''
+      }, 'recovery'));
+    }
+  } else if (isDetailOpen && (window._activeExerciseTarget === 'detail' || _activeExerciseTarget === 'detail')) {
+    const detailContainer = $('wo-detail-exercises-container');
+    if (detailContainer) {
+      if (typeof window._createDetailExerciseRow === 'function') {
+        detailContainer.appendChild(window._createDetailExerciseRow({
+          name,
+          muscle: muscleKey,
+          sets: 4,
+          reps: 10,
+          weight: ''
+        }));
+      }
+    }
+  }
+
+  const savedFromProgramsOrExercises = _activeExerciseTarget === 'programs' || _activeExerciseTarget === 'exercises' || (!isRoutineOpen && !isProtoOpen && !isDetailOpen);
+
+  // 3. Modál bezárása és űrlap alaphelyzetbe állítása azonnal
+  _activeExerciseTarget = null;
+  if (typeof window !== 'undefined') window._activeExerciseTarget = null;
+  _closeExercisesModal();
+  _resetExerciseForm();
+  _renderExercisesList();
+  if (typeof _renderUnifiedExercisesList === 'function') {
+    _renderUnifiedExercisesList();
+  }
+  _updateSubcategoryDatalists();
+
+  if (savedFromProgramsOrExercises) {
+    _templateActiveSub = 'exercises';
+    _renderUnifiedTemplatesScreen();
+  }
+
+  // 4. Háttérben mentés Firestore-ba
+  if (db && uid && !uid.startsWith('local_')) {
+    const payload = {
+      name,
+      category,
+      subcategory,
+      mainCategory: mainCat,
+      notes,
+      videoUrl,
+      muscle: muscleLabel,
+      targetMuscle: !isRelief ? muscleLabel : '',
+      targetMuscles: !isRelief ? [muscleKey] : [],
+      relievedMuscle: isRelief ? muscleLabel : '',
+      relievedMuscles: isRelief ? [muscleKey] : [],
+      muscleKey,
+      updatedAt: serverTimestamp()
+    };
+    if (editId) {
+      updateDoc(doc(db, 'users', uid, 'exercises', editId), payload).catch(err => {
+        console.warn('[activity] Firestore exercise update error (kept local):', err);
+      });
+    } else {
+      addDoc(collection(db, 'users', uid, 'exercises'), { ...payload, createdAt: serverTimestamp() }).then(ref => {
+        const item = _allExercises.find(x => x.id === exId);
+        if (item) {
+          item.id = ref.id;
+          _saveExercisesToLocal(uid);
+        }
+      }).catch(err => {
+        console.warn('[activity] Firestore exercise add error (kept local):', err);
+      });
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// FELSZERELÉSEK (GEAR) KEZELŐJE
+// ══════════════════════════════════════════════════════════════
+
+function _setGearMaintTypeUI(type) {
+  _gearMaintType = type === 'time' ? 'time' : 'distance';
+  const distBtn = $('wo-gear-maint-type-dist');
+  const timeBtn = $('wo-gear-maint-type-time');
+  const distWrap = $('wo-gear-maint-dist-wrap');
+  const timeWrap = $('wo-gear-maint-time-wrap');
+
+  if (distBtn && timeBtn) {
+    if (_gearMaintType === 'distance') {
+      distBtn.className = 'wo-gear-maint-type-btn py-1.5 px-3 rounded-xl border border-indigo-600 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300 font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all';
+      timeBtn.className = 'wo-gear-maint-type-btn py-1.5 px-3 rounded-xl border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-gray-500 font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all';
+    } else {
+      timeBtn.className = 'wo-gear-maint-type-btn py-1.5 px-3 rounded-xl border border-indigo-600 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300 font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all';
+      distBtn.className = 'wo-gear-maint-type-btn py-1.5 px-3 rounded-xl border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-gray-500 font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all';
+    }
+  }
+
+  if (distWrap) distWrap.classList.toggle('hidden', _gearMaintType !== 'distance');
+  if (timeWrap) timeWrap.classList.toggle('hidden', _gearMaintType !== 'time');
+}
+
+let _editingGearId = null;
+let _gearMaintType = 'distance';
+let _gearDefaultSports = [];
+let _selectedWorkoutGearIds = new Set();
+
+function _renderGearDefaultSportsChips() {
+  const container = $('wo-gear-default-sports-container');
+  if (!container) return;
+
+  if (!_gearDefaultSports || _gearDefaultSports.length === 0) {
+    container.innerHTML = '<span class="text-[10px] text-gray-400 italic">Nincs még hozzárendelve alapértelmezett sportág.</span>';
+    return;
+  }
+
+  container.innerHTML = _gearDefaultSports.map(sId => {
+    const sport = getSportById(sId);
+    const name = sport?.name || sId;
+    const icon = sport?.icon || 'fa-solid fa-person-running';
+    return `
+      <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 text-xs font-semibold">
+        <i class="${icon} text-[10px] text-indigo-500"></i>
+        <span>${name}</span>
+        <button type="button" class="wo-remove-default-sport-btn text-indigo-400 hover:text-red-500 ml-0.5 p-0.5 transition-colors cursor-pointer" data-sport-id="${sId}" title="Eltávolítás">
+          <i class="fa-solid fa-xmark text-[10px] pointer-events-none"></i>
+        </button>
+      </span>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.wo-remove-default-sport-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const sId = btn.dataset.sportId;
+      _gearDefaultSports = _gearDefaultSports.filter(s => s !== sId);
+      _renderGearDefaultSportsChips();
+      _populateGearDefaultSportSelect();
+    });
+  });
+}
+
+function _populateGearDefaultSportSelect() {
+  const select = $('wo-gear-default-sport-select');
+  if (!select) return;
+
+  const available = GARMIN_SPORTS.filter(s => !_gearDefaultSports.includes(s.id));
+  select.innerHTML = `
+    <option value="">+ Alapértelmezett edzésforma kiválasztása...</option>
+    ${available.map(s => `<option value="${s.id}">${s.name} (${s.cat || 'Sport'})</option>`).join('')}
+  `;
+}
+
+function _startEditGear(gearId) {
+  const gear = _allGears.find(g => g.id === gearId);
+  if (!gear) return;
+
+  _editingGearId = gearId;
+
+  const nameIn = $('wo-new-gear-name');
+  const typeIn = $('wo-new-gear-type');
+  const imageIn = $('wo-new-gear-image');
+  const maxKmIn = $('wo-new-gear-maxkm');
+  const initKmIn = $('wo-new-gear-initkm');
+  const initHoursIn = $('wo-new-gear-inithours');
+  const maintKmIn = $('wo-new-gear-maintkm');
+  const maintDaysIn = $('wo-new-gear-maintdays');
+  const titleEl = $('wo-gear-form-title');
+  const cancelBtn = $('wo-cancel-edit-gear-btn');
+  const saveBtn = $('wo-save-gear-btn');
+
+  if (nameIn) nameIn.value = gear.name || '';
+  if (typeIn) typeIn.value = gear.type || 'shoes';
+  if (imageIn) imageIn.value = gear.imageUrl || gear.image || '';
+  if (maxKmIn) maxKmIn.value = gear.maxKm != null ? gear.maxKm : '';
+  if (initKmIn) initKmIn.value = gear.totalKm != null ? Math.round(gear.totalKm * 10) / 10 : 0;
+  if (initHoursIn) initHoursIn.value = gear.totalHours != null ? Math.round(gear.totalHours * 10) / 10 : 0;
+  if (maintKmIn) maintKmIn.value = gear.maintenanceKm || 500;
+  if (maintDaysIn) maintDaysIn.value = gear.maintenanceDays || 90;
+
+  _gearDefaultSports = Array.isArray(gear.defaultSports) ? [...gear.defaultSports] : (gear.defaultSport ? [gear.defaultSport] : []);
+  _renderGearDefaultSportsChips();
+  _populateGearDefaultSportSelect();
+
+  _setGearMaintTypeUI(gear.maintType === 'time' ? 'time' : 'distance');
+
+  if (titleEl) titleEl.textContent = `Felszerelés szerkesztése: ${gear.name}`;
+  if (cancelBtn) cancelBtn.classList.remove('hidden');
+  if (saveBtn) saveBtn.textContent = 'Módosítások mentése';
+
+  _openGearModal();
+
+  const formCard = $('wo-gear-form-card');
+  if (formCard) {
+    formCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function _resetGearForm() {
+  _editingGearId = null;
+  _gearDefaultSports = [];
+
+  const nameIn = $('wo-new-gear-name');
+  const imageIn = $('wo-new-gear-image');
+  const maxKmIn = $('wo-new-gear-maxkm');
+  const initKmIn = $('wo-new-gear-initkm');
+  const initHoursIn = $('wo-new-gear-inithours');
+  const maintKmIn = $('wo-new-gear-maintkm');
+  const maintDaysIn = $('wo-new-gear-maintdays');
+  const titleEl = $('wo-gear-form-title');
+  const cancelBtn = $('wo-cancel-edit-gear-btn');
+  const saveBtn = $('wo-save-gear-btn');
+
+  if (nameIn) nameIn.value = '';
+  if (imageIn) imageIn.value = '';
+  if (maxKmIn) maxKmIn.value = '';
+  if (initKmIn) initKmIn.value = '';
+  if (initHoursIn) initHoursIn.value = '';
+  if (maintKmIn) maintKmIn.value = '500';
+  if (maintDaysIn) maintDaysIn.value = '90';
+
+  _renderGearDefaultSportsChips();
+  _populateGearDefaultSportSelect();
+
+  if (titleEl) titleEl.textContent = '+ Új felszerelés regisztrálása';
+  if (cancelBtn) cancelBtn.classList.add('hidden');
+  if (saveBtn) {
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Felszerelés mentése';
+  }
+
+  _setGearMaintTypeUI('distance');
+}
+
+function _bindGearEvents() {
+  const openGearBtn = $('wo-open-gear-btn');
+  const closeBtn = $('wo-gear-close') || $('wo-gear-modal-close');
+  const backdrop = $('wo-gear-backdrop') || $('wo-gear-modal-backdrop');
+  const saveBtn = $('wo-save-gear-btn');
+  const cancelBtn = $('wo-cancel-edit-gear-btn');
+  const distBtn = $('wo-gear-maint-type-dist');
+  const timeBtn = $('wo-gear-maint-type-time');
+  const defaultSportSelect = $('wo-gear-default-sport-select');
+
+  if (openGearBtn && !openGearBtn.dataset.bound) {
+    openGearBtn.dataset.bound = 'true';
+    openGearBtn.addEventListener('click', () => {
+      _resetGearForm();
+      _openGearModal();
+    });
+  }
+  if (closeBtn && !closeBtn.dataset.bound) {
+    closeBtn.dataset.bound = 'true';
+    closeBtn.addEventListener('click', _closeGearModal);
+  }
+  if (backdrop && !backdrop.dataset.bound) {
+    backdrop.dataset.bound = 'true';
+    backdrop.addEventListener('click', _closeGearModal);
+  }
+  if (saveBtn && !saveBtn.dataset.bound) {
+    saveBtn.dataset.bound = 'true';
+    saveBtn.addEventListener('click', _saveGear);
+  }
+  if (cancelBtn && !cancelBtn.dataset.bound) {
+    cancelBtn.dataset.bound = 'true';
+    cancelBtn.addEventListener('click', _resetGearForm);
+  }
+  if (distBtn && !distBtn.dataset.bound) {
+    distBtn.dataset.bound = 'true';
+    distBtn.addEventListener('click', () => _setGearMaintTypeUI('distance'));
+  }
+  if (timeBtn && !timeBtn.dataset.bound) {
+    timeBtn.dataset.bound = 'true';
+    timeBtn.addEventListener('click', () => _setGearMaintTypeUI('time'));
+  }
+  if (defaultSportSelect && !defaultSportSelect.dataset.bound) {
+    defaultSportSelect.dataset.bound = 'true';
+    defaultSportSelect.addEventListener('change', () => {
+      const val = defaultSportSelect.value;
+      if (val && !_gearDefaultSports.includes(val)) {
+        _gearDefaultSports.push(val);
+        _renderGearDefaultSportsChips();
+        _populateGearDefaultSportSelect();
+      }
+    });
+  }
+
+  const gearSelect = $('wo-gear-select');
+  if (gearSelect && !gearSelect.dataset.multiBound) {
+    gearSelect.dataset.multiBound = 'true';
+    gearSelect.addEventListener('change', () => {
+      const val = gearSelect.value;
+      if (val) {
+        _selectedWorkoutGearIds.add(val);
+        _renderSelectedWorkoutGears();
+      }
+    });
+  }
+}
+
+function _openGearModal() {
+  const modal = $('wo-gear-modal');
+  const sheet = $('wo-gear-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = '';
+  _populateGearDefaultSportSelect();
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+
+function _closeGearModal() {
+  const modal = $('wo-gear-modal');
+  const sheet = $('wo-gear-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = 'none';
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    modal.style.pointerEvents = '';
+    _resetGearForm();
+  }, 340);
+}
+
+async function _saveGear() {
+  if (!_uid) return;
+  const nameIn = $('wo-new-gear-name');
+  const typeIn = $('wo-new-gear-type');
+  const imageIn = $('wo-new-gear-image');
+  const maxKmIn = $('wo-new-gear-maxkm');
+  const initKmIn = $('wo-new-gear-initkm');
+  const initHoursIn = $('wo-new-gear-inithours');
+  const maintKmIn = $('wo-new-gear-maintkm');
+  const maintDaysIn = $('wo-new-gear-maintdays');
+  const saveBtn = $('wo-save-gear-btn');
+
+  const name = nameIn?.value.trim();
+  if (!name) {
+    if (nameIn) nameIn.focus();
+    return;
+  }
+
+  const type = typeIn?.value || 'shoes';
+  const imageUrl = imageIn?.value.trim() || '';
+  const maxKm = parseFloat(maxKmIn?.value) || null;
+  const totalKm = parseFloat(initKmIn?.value) || 0;
+  const totalHours = parseFloat(initHoursIn?.value) || 0;
+  const maintType = _gearMaintType || 'distance';
+  const maintenanceKm = parseFloat(maintKmIn?.value) || 500;
+  const maintenanceDays = parseInt(maintDaysIn?.value, 10) || 90;
+  const defaultSports = [..._gearDefaultSports];
+  const defaultSport = defaultSports[0] || '';
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Mentés...';
+  }
+
+  try {
+    if (_editingGearId) {
+      // Meglévő felszerelés módosítása
+      await updateDoc(doc(db, 'users', _uid, 'gear', _editingGearId), {
+        name,
+        type,
+        imageUrl,
+        maxKm,
+        totalKm,
+        totalHours,
+        maintType,
+        maintenanceKm,
+        maintenanceDays,
+        defaultSports,
+        defaultSport,
+        updatedAt: serverTimestamp()
+      });
+    } else {
+      // Új felszerelés hozzáadása
+      await addDoc(collection(db, 'users', _uid, 'gear'), {
+        name,
+        type,
+        imageUrl,
+        maxKm,
+        totalKm,
+        totalHours,
+        maintType,
+        maintenanceKm,
+        maintenanceDays,
+        defaultSports,
+        defaultSport,
+        lastMaintainedKm: totalKm,
+        lastMaintainedDate: new Date().toISOString(),
+        active: true,
+        createdAt: serverTimestamp()
+      });
+    }
+
+    _resetGearForm();
+    _closeGearModal();
+  } catch (err) {
+    console.error('[activity] Error saving gear:', err);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = _editingGearId ? 'Módosítások mentése' : 'Felszerelés mentése';
+    }
+  }
+}
+
+function _renderGearShelf() {
+  const container = $('wo-gear-list');
+  const shelfContainer = $('activity-gear-shelf-container');
+
+  const targets = [container, shelfContainer].filter(Boolean);
+  if (targets.length === 0) return;
+
+  const html = _allGears.length === 0 ? `
+    <div class="text-center py-8 bg-white dark:bg-slate-900 rounded-3xl border border-gray-100 dark:border-slate-800 p-6">
+      <div class="w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-500 mx-auto flex items-center justify-center mb-3">
+        <i class="fa-solid fa-shoe-prints text-xl"></i>
+      </div>
+      <p class="text-xs font-bold text-gray-700 dark:text-gray-300">Nincs még regisztrált felszerelésed</p>
+      <p class="text-[11px] text-gray-400 mt-1">Adj hozzá futócipőt vagy kerékpárt, és kövesd a megtett kilométereket!</p>
+    </div>
+  ` : _allGears.map(g => {
+    const kmPct = g.maxKm ? Math.min(100, Math.round(((g.totalKm || 0) / g.maxKm) * 100)) : 0;
+    const isTimeMaint = g.maintType === 'time';
+    const icon = g.type === 'bike' ? 'fa-solid fa-bicycle' : (g.type === 'device' ? 'fa-solid fa-stopwatch' : 'fa-solid fa-shoe-prints');
+
+    // Teljes élettartam statisztikák (az 1. használattól számolva, karbantartáskor SOHA nem nullázódik)
+    const totalDistKm = Math.round((Number(g.totalKm) || 0) * 10) / 10;
+    const totalHours = Math.round((Number(g.totalHours) || 0) * 10) / 10;
+    const lifetimeText = `(${totalDistKm} km · ${totalHours} óra)`;
+
+    const defSports = Array.isArray(g.defaultSports) ? g.defaultSports : (g.defaultSport ? [g.defaultSport] : []);
+    const defSportsText = defSports.map(sId => getSportById(sId)?.name || sId).join(', ');
+
+    let maintRemaining = 0;
+    let maintLimitText = '';
+    let maintTitle = '';
+    let maintPct = 100;
+    let isDue = false;
+
+    if (isTimeMaint) {
+      // Időtartam alapú karbantartás
+      const maintDays = Number(g.maintenanceDays) || 90;
+      const lastDate = g.lastMaintainedDate ? new Date(g.lastMaintainedDate) : (g.createdAt?.toDate ? g.createdAt.toDate() : new Date());
+      const now = new Date();
+      const diffMs = Math.max(0, now.getTime() - lastDate.getTime());
+      const daysPassed = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      const daysRem = Math.max(0, maintDays - daysPassed);
+      maintRemaining = daysRem;
+      maintPct = Math.max(0, Math.min(100, Math.round((daysRem / maintDays) * 100)));
+      maintTitle = 'Karbantartásig hátra (Idő)';
+      maintLimitText = `${daysRem} nap <span class="text-[10px] font-normal text-gray-400">/ ${maintDays} nap</span>`;
+      isDue = daysRem === 0;
+    } else {
+      // Távolság alapú karbantartás
+      const maintLimit = Number(g.maintenanceKm) || 500;
+      const lastMaint = g.lastMaintainedKm != null ? Number(g.lastMaintainedKm) : 0;
+      const kmSinceMaint = Math.max(0, (Number(g.totalKm) || 0) - lastMaint);
+      const remKm = Math.max(0, Math.round((maintLimit - kmSinceMaint) * 10) / 10);
+      maintRemaining = remKm;
+      maintPct = Math.max(0, Math.min(100, Math.round((remKm / maintLimit) * 100)));
+      maintTitle = 'Karbantartásig hátra (Táv)';
+      maintLimitText = `${remKm} km <span class="text-[10px] font-normal text-gray-400">/ ${maintLimit} km</span>`;
+      isDue = remKm === 0;
+    }
+
+    const circumference = 113.1;
+    const strokeOffset = circumference - (circumference * maintPct) / 100;
+    const strokeColor = maintPct > 50 ? '#10b981' : (maintPct > 20 ? '#f59e0b' : '#ef4444');
+
+    const imageHtml = g.imageUrl ? `
+      <div class="w-11 h-11 rounded-2xl overflow-hidden border border-gray-200 dark:border-slate-700/80 flex-shrink-0 bg-gray-100 dark:bg-slate-800 flex items-center justify-center relative">
+        <img src="${g.imageUrl}" alt="${g.name}" class="w-full h-full object-cover" onerror="this.style.display='none'; this.nextElementSibling.classList.remove('hidden');" />
+        <div class="hidden w-full h-full flex items-center justify-center text-indigo-500"><i class="${icon}"></i></div>
+      </div>
+    ` : `
+      <div class="w-11 h-11 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 flex items-center justify-center text-sm flex-shrink-0">
+        <i class="${icon}"></i>
+      </div>
+    `;
+
+    return `
+      <div class="p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm transition-all hover:shadow-md">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-3 min-w-0 pr-2">
+            ${imageHtml}
+            <div class="min-w-0">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <h4 class="text-xs font-bold text-gray-900 dark:text-white truncate">${g.brand ? `${g.brand} ` : ''}${g.name}</h4>
+                <span class="text-[9px] bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300 px-2 py-0.5 rounded-full font-semibold">
+                  ${isTimeMaint ? 'Idő alapú' : 'Táv alapú'}
+                </span>
+                ${defSports.length > 0 ? `
+                  <span class="text-[9px] bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 px-2 py-0.5 rounded-full font-semibold flex items-center gap-1">
+                    <i class="fa-solid fa-bolt text-[8px]"></i> Alapértelmezett: ${defSportsText}
+                  </span>
+                ` : ''}
+              </div>
+              <p class="text-[10px] text-gray-400 mt-0.5">
+                <span class="font-bold text-gray-700 dark:text-gray-200">${totalDistKm} km</span> · 
+                <span class="font-bold text-gray-700 dark:text-gray-200">${totalHours} óra</span>
+                <span class="text-[9px] text-gray-400 ml-1 font-medium">(első használattól, nem nullázódik)</span>
+              </p>
+            </div>
+          </div>
+          <div class="flex items-center gap-1 flex-shrink-0">
+            <button class="wo-edit-gear-btn text-gray-400 hover:text-indigo-600 p-1.5 transition-colors rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800" data-id="${g.id}" title="Felszerelés szerkesztése">
+              <i class="fa-solid fa-pen text-xs pointer-events-none"></i>
+            </button>
+            <button class="wo-delete-gear-btn text-gray-300 hover:text-red-500 p-1.5 transition-colors rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800" data-id="${g.id}" title="Felszerelés törlése">
+              <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+            </button>
+          </div>
+        </div>
+
+        ${g.maxKm ? `
+          <div class="mt-2">
+            <div class="flex justify-between text-[10px] text-gray-400 font-semibold mb-1">
+              <span>Teljes élettartam</span>
+              <span>${Math.round(g.totalKm || 0)} / ${g.maxKm} km (${kmPct}%)</span>
+            </div>
+            <div class="w-full h-2 bg-gray-100 dark:bg-slate-800 rounded-full overflow-hidden">
+              <div class="h-full rounded-full ${kmPct > 85 ? 'bg-red-500' : 'bg-indigo-600'}" style="width: ${kmPct}%;"></div>
+            </div>
+          </div>
+        ` : ''}
+
+        <!-- Karbantartási visszaszámláló & Kör widget -->
+        <div class="mt-3 p-3 rounded-2xl bg-gray-50 dark:bg-slate-800/60 border border-gray-100 dark:border-slate-800 flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="relative w-12 h-12 flex items-center justify-center flex-shrink-0">
+              <svg class="w-12 h-12 -rotate-90 transform" viewBox="0 0 44 44">
+                <circle cx="22" cy="22" r="18" fill="none" stroke="currentColor" stroke-width="3" class="text-gray-200 dark:text-slate-700" />
+                <circle cx="22" cy="22" r="18" fill="none" stroke="${strokeColor}" stroke-width="3" stroke-dasharray="113.1" stroke-dashoffset="${strokeOffset}" stroke-linecap="round" class="transition-all duration-500" />
+              </svg>
+              <span class="absolute text-[9px] font-black ${maintPct > 20 ? 'text-gray-800 dark:text-gray-200' : 'text-red-500'}">${maintPct}%</span>
+            </div>
+            <div>
+              <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">${maintTitle}</div>
+              <div class="text-xs font-black ${isDue ? 'text-red-500' : 'text-gray-900 dark:text-white'} flex flex-wrap items-baseline gap-1.5">
+                <span>${maintLimitText}</span>
+                <span class="text-[10px] font-bold text-indigo-600 dark:text-indigo-400 font-mono tracking-tight" title="Megtett táv és használati idő az első használattól (nem indul újra karbantartásnál)">${lifetimeText}</span>
+              </div>
+              ${isDue ? '<span class="text-[9px] font-bold text-red-500 animate-pulse block">Karbantartás esedékes!</span>' : ''}
+            </div>
+          </div>
+          <button class="wo-maintain-gear-btn px-2.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/60 dark:hover:bg-indigo-900 text-indigo-600 dark:text-indigo-400 text-[10px] font-bold active:scale-95 transition-all flex items-center gap-1.5 shadow-sm" data-id="${g.id}" title="Karbantartás elvégezve, számláló újraindítása">
+            <i class="fa-solid fa-wrench"></i>
+            <span>Karbantartva</span>
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  targets.forEach(t => {
+    t.innerHTML = html;
+
+    t.querySelectorAll('.wo-edit-gear-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        if (id) _startEditGear(id);
+      });
+    });
+
+    t.querySelectorAll('.wo-delete-gear-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        if (id && _uid) {
+          try {
+            await deleteDoc(doc(db, 'users', _uid, 'gear', id));
+          } catch (err) {
+            console.error('[activity] Error deleting gear:', err);
+          }
+        }
+      });
+    });
+
+    t.querySelectorAll('.wo-maintain-gear-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        if (id && _uid) {
+          try {
+            const gear = _allGears.find(x => x.id === id);
+            const currKm = gear ? (Number(gear.totalKm) || 0) : 0;
+            await updateDoc(doc(db, 'users', _uid, 'gear', id), {
+              lastMaintainedKm: currKm,
+              lastMaintainedDate: new Date().toISOString()
+            });
+          } catch (err) {
+            console.error('[activity] Error resetting gear maintenance:', err);
+          }
+        }
+      });
+    });
+  });
+}
+
+function _renderSelectedWorkoutGears() {
+  const container = $('wo-selected-gears-list');
+  const select = $('wo-gear-select') || $('wo-select-gear');
+  const autoBadge = $('wo-gear-auto-badge');
+
+  if (autoBadge) {
+    autoBadge.classList.toggle('hidden', _selectedWorkoutGearIds.size === 0);
+  }
+
+  if (container) {
+    if (_selectedWorkoutGearIds.size === 0) {
+      container.innerHTML = '<span class="text-[10px] text-gray-400 italic">Nincs felszerelés kiválasztva</span>';
+    } else {
+      const selectedArr = Array.from(_selectedWorkoutGearIds).map(id => _allGears.find(g => g.id === id)).filter(Boolean);
+      container.innerHTML = selectedArr.map(g => {
+        const icon = g.type === 'bike' ? 'fa-solid fa-bicycle' : (g.type === 'device' ? 'fa-solid fa-stopwatch' : 'fa-solid fa-shoe-prints');
+        const km = Math.round((Number(g.totalKm) || 0) * 10) / 10;
+        const hrs = Math.round((Number(g.totalHours) || 0) * 10) / 10;
+        return `
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 text-xs font-semibold">
+            <i class="${icon} text-[10px] text-indigo-500"></i>
+            <span class="truncate max-w-[140px]">${g.brand ? `${g.brand} ` : ''}${g.name}</span>
+            <span class="text-[9px] text-gray-400 font-mono">(${km} km · ${hrs} ó)</span>
+            <button type="button" class="wo-remove-selected-gear-btn text-indigo-400 hover:text-red-500 ml-0.5 p-0.5 transition-colors cursor-pointer" data-id="${g.id}" title="Eltávolítás">
+              <i class="fa-solid fa-xmark text-[10px] pointer-events-none"></i>
+            </button>
+          </span>
+        `;
+      }).join('');
+
+      container.querySelectorAll('.wo-remove-selected-gear-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const id = btn.dataset.id;
+          _selectedWorkoutGearIds.delete(id);
+          _renderSelectedWorkoutGears();
+        });
+      });
+    }
+  }
+
+  if (select) {
+    const unselectedGears = _allGears.filter(g => !_selectedWorkoutGearIds.has(g.id));
+    select.innerHTML = `
+      <option value="">+ Felszerelés hozzáadása...</option>
+      ${unselectedGears.map(g => {
+        const km = Math.round((Number(g.totalKm) || 0) * 10) / 10;
+        const hrs = Math.round((Number(g.totalHours) || 0) * 10) / 10;
+        return `<option value="${g.id}">${g.brand ? `${g.brand} ` : ''}${g.name} (${km} km · ${hrs} óra)</option>`;
+      }).join('')}
+    `;
+    select.value = '';
+  }
+}
+
+function _populateGearSelects() {
+  _renderSelectedWorkoutGears();
+}
+
+window.renderGearShelf = _renderGearShelf;
+window.openGearModal = _openGearModal;
+window.startEditGear = _startEditGear;
+window._selectedWorkoutGearIds = _selectedWorkoutGearIds;
+window.renderSelectedWorkoutGears = _renderSelectedWorkoutGears;
+
+// ══════════════════════════════════════════════════════════════
+// REGENERÁCIÓ (SMR, NYÚJTÁS, SZAUNA, ALVÁSNAPLÓ)
+// ══════════════════════════════════════════════════════════════
+
+function _bindRecoveryModuleEvents() {
+  const fab = $('rec-fab');
+  const closeBtn = $('rec-modal-close');
+  const backdrop = $('rec-modal-backdrop');
+  const saveBtn = $('rec-save-btn');
+  const protoOpenBtn = $('rec-open-protocols-btn');
+
+  if (fab) fab.addEventListener('click', _openSleepModal);
+  if (closeBtn) closeBtn.addEventListener('click', _closeSleepModal);
+  if (backdrop) backdrop.addEventListener('click', _closeSleepModal);
+  if (saveBtn) saveBtn.addEventListener('click', _saveSleep);
+  if (protoOpenBtn) protoOpenBtn.addEventListener('click', _openProtocolsModal);
+
+  // Protokollok modál
+  const protoClose = $('rec-protocols-modal-close') || $('rec-protocols-close');
+  const protoBackdrop = $('rec-protocols-modal-backdrop') || $('rec-protocols-backdrop');
+  const protoSave = $('rec-save-protocol-btn');
+
+  if (protoClose) protoClose.addEventListener('click', _closeProtocolsModal);
+  if (protoBackdrop) protoBackdrop.addEventListener('click', _closeProtocolsModal);
+  if (protoSave) protoSave.addEventListener('click', _saveProtocol);
+  const protoAddExBtn = $('rec-proto-add-ex-btn');
+  if (protoAddExBtn) {
+    protoAddExBtn.addEventListener('click', () => {
+      _activeExerciseTarget = 'recovery';
+      _openExercisesModal();
+    });
+  }
+}
+
+function _openSleepModal() {
+  const modal = $('rec-modal');
+  const sheet = $('rec-modal-sheet');
+  if (!modal || !sheet) return;
+
+  const dateIn = $('rec-input-date');
+  if (dateIn) dateIn.value = _selectedDate || todayString();
+
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+    });
+  });
+}
+
+function _closeSleepModal() {
+  const modal = $('rec-modal');
+  const sheet = $('rec-modal-sheet');
+  if (!modal || !sheet) return;
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => modal.classList.add('hidden'), 340);
+}
+
+function _openProtocolsModal() {
+  const modal = $('rec-protocols-modal');
+  const sheet = $('rec-protocols-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = '';
+  _renderProtocolsList();
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      sheet.style.transform = 'translateY(0)';
+      const nameIn = $('rec-proto-name-in');
+      if (nameIn) {
+        setTimeout(() => {
+          nameIn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          nameIn.focus();
+        }, 300);
+      }
+    });
+  });
+}
+window.openProtocolsModal = _openProtocolsModal;
+
+function _closeProtocolsModal() {
+  const modal = $('rec-protocols-modal');
+  const sheet = $('rec-protocols-sheet');
+  if (!modal || !sheet) return;
+  modal.style.pointerEvents = 'none';
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    modal.style.pointerEvents = '';
+  }, 340);
+}
+
+async function _saveSleep() {
+  if (!_uid) return;
+  const dateIn = $('rec-input-date');
+  const bedIn = $('rec-input-bedtime');
+  const wakeIn = $('rec-input-wakeup');
+  const notesIn = $('rec-input-notes');
+  const saveBtn = $('rec-save-btn');
+
+  const bedtime = bedIn?.value || '23:00';
+  const wakeup = wakeIn?.value || '07:00';
+
+  const [bh, bm] = bedtime.split(':').map(Number);
+  const [wh, wm] = wakeup.split(':').map(Number);
+  let mins = (wh * 60 + wm) - (bh * 60 + bm);
+  if (mins < 0) mins += 24 * 60;
+  const durationHours = Math.round(mins / 6) / 10;
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Mentés...';
+  }
+
+  try {
+    await addDoc(collection(db, 'users', _uid, 'sleepLogs'), {
+      date: dateIn?.value || todayString(),
+      bedtime,
+      wakeup,
+      durationHours,
+      notes: notesIn?.value.trim() || '',
+      createdAt: serverTimestamp()
+    });
+    _closeSleepModal();
+  } catch (err) {
+    console.error('[activity] Error saving sleep log:', err);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Alvás mentése';
+    }
+  }
+}
+
+function _renderSleepList() {
+  const container = $('rec-records-list');
+  if (!container) return;
+
+  if (_allSleepLogs.length === 0) {
+    container.innerHTML = `
+      <div class="text-center py-8 bg-white dark:bg-slate-900 rounded-3xl border border-gray-100 dark:border-slate-800 p-6">
+        <div class="w-12 h-12 rounded-2xl bg-violet-50 dark:bg-violet-950/60 text-violet-500 mx-auto flex items-center justify-center mb-3">
+          <i class="fa-solid fa-moon text-xl"></i>
+        </div>
+        <p class="text-xs font-bold text-gray-700 dark:text-gray-300">Nincs még alvási adatod</p>
+        <p class="text-[11px] text-gray-400 mt-1">Rögzítsd lefekvési és ébredési idődet a pontos alvási analitikához!</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = _allSleepLogs.map(s => `
+    <div class="p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-2xl bg-violet-50 dark:bg-violet-950/60 text-violet-500 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-bed"></i>
+        </div>
+        <div>
+          <h4 class="text-xs font-bold text-gray-900 dark:text-white">${s.date}</h4>
+          <p class="text-[10px] text-gray-400 font-semibold">${s.bedtime} → ${s.wakeup}</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="text-sm font-extrabold text-violet-600 dark:text-violet-400">${s.durationHours} óra</span>
+        <button class="rec-delete-sleep-btn text-gray-300 hover:text-red-500 p-1.5" data-id="${s.id}">
+          <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+        </button>
+      </div>
+    </div>
+  `).join('');
+
+  container.querySelectorAll('.rec-delete-sleep-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id && _uid) {
+        try {
+          await deleteDoc(doc(db, 'users', _uid, 'sleepLogs', id));
+        } catch (err) {
+          console.error('[activity] Error deleting sleep:', err);
+        }
+      }
+    });
+  });
+}
+
+function _updateSleepStats() {
+  const avgEl = $('rec-stat-avg');
+  const bestEl = $('rec-stat-best');
+  const totalEl = $('rec-stat-total');
+
+  if (totalEl) totalEl.textContent = _allSleepLogs.length;
+
+  if (_allSleepLogs.length === 0) {
+    if (avgEl) avgEl.textContent = '—';
+    if (bestEl) bestEl.textContent = '—';
+    return;
+  }
+
+  const hoursList = _allSleepLogs.map(s => Number(s.durationHours) || 0).filter(h => h > 0);
+  if (hoursList.length > 0) {
+    const avg = Math.round((hoursList.reduce((s, h) => s + h, 0) / hoursList.length) * 10) / 10;
+    const best = Math.max(...hoursList);
+    if (avgEl) avgEl.textContent = `${avg} ó`;
+    if (bestEl) bestEl.textContent = `${best} ó`;
+  }
+}
+
+function _renderProtocolsList() {
+  const containers = [$('rec-protocols-list'), $('rec-protocols-items')].filter(Boolean);
+  if (containers.length === 0) return;
+
+  const deletedSampleIds = _getDeletedSampleIds('protocols');
+  const activeDefaultProtocols = (DEFAULT_RECOVERY_PROTOCOLS || []).filter(p => !deletedSampleIds.includes(p.id) && !deletedSampleIds.includes(p.name));
+  const all = [...activeDefaultProtocols, ..._allProtocols];
+
+  if (all.length === 0) {
+    const emptyHtml = `<p class="text-xs text-gray-400 text-center py-6">Nincs elérhető regenerációs program.</p>`;
+    containers.forEach(c => { c.innerHTML = emptyHtml; });
+    return;
+  }
+
+  const html = all.map((p, idx) => {
+    const isCustom = Boolean(p.id && !p.isSample);
+    const muscleName = p.relievedMuscleLabel || p.relievedMuscle || (p.relievedMuscles && p.relievedMuscles[0]) || '';
+    return `
+      <div class="p-4 rounded-3xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <div class="w-8 h-8 rounded-xl bg-violet-50 dark:bg-violet-950/60 text-violet-500 flex items-center justify-center text-xs">
+              <i class="fa-solid fa-spa"></i>
+            </div>
+            <div>
+              <h4 class="text-xs font-bold text-gray-900 dark:text-white">${p.name}</h4>
+              <p class="text-[10px] text-gray-400">${p.duration || 20} perc · ${p.type || 'SMR / Nyújtás'}${muscleName ? ` · <span class="text-violet-500 font-semibold">${muscleName}</span>` : ''}</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${isCustom ? 'bg-violet-100 text-violet-600' : 'bg-gray-100 dark:bg-slate-800 text-gray-500'}">
+              ${isCustom ? 'Saját' : 'Minta'}
+            </span>
+            ${isCustom ? `
+              <button class="rec-delete-proto-btn text-gray-300 hover:text-red-500 p-1 transition-colors" data-id="${p.id}" data-name="${_esc(p.name)}" title="Program törlése">
+                <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+              </button>
+            ` : `
+              <button class="rec-delete-proto-btn text-gray-300 hover:text-red-500 p-1 transition-colors" data-id="${p.id || p.name}" data-name="${_esc(p.name)}" data-is-sample="true" title="Minta program törlése">
+                <i class="fa-solid fa-xmark text-xs pointer-events-none"></i>
+              </button>
+            `}
+          </div>
+        </div>
+
+        <div class="p-3 rounded-2xl bg-gray-50 dark:bg-slate-800/60 font-mono text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-line leading-relaxed mb-3">
+          ${p.exercises || ''}
+        </div>
+
+        <button class="rec-apply-protocol-btn w-full py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-bold text-xs active:scale-95 transition-all flex items-center justify-center gap-1.5"
+                data-idx="${idx}">
+          <i class="fa-solid fa-check text-[10px]"></i>
+          <span>Beemelés a mai napba (Rögzítés)</span>
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  containers.forEach(container => {
+    container.innerHTML = html;
+
+    container.querySelectorAll('.rec-apply-protocol-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const idx = parseInt(btn.dataset.idx, 10);
+        const proto = all[idx];
+        if (!proto || !_uid) return;
+
+        try {
+          await addDoc(collection(db, 'users', _uid, 'recoveryProtocols'), {
+            name: proto.name,
+            type: proto.type || 'smr',
+            duration: proto.duration || 20,
+            exercises: proto.exercises || '',
+            relievedMuscles: proto.relievedMuscles || (proto.relievedMuscle ? [proto.relievedMuscle] : ['all']),
+            relievedMuscle: proto.relievedMuscle || 'all',
+            relievedMuscleLabel: proto.relievedMuscleLabel || '',
+            date: (typeof window.getWhoopDate === 'function' ? window.getWhoopDate() : null) || window._whoopSelectedDate || _selectedDate || todayString(),
+            createdAt: serverTimestamp()
+          });
+          _closeProtocolsModal();
+        } catch (err) {
+          console.error('[activity] Error recording protocol:', err);
+        }
+      });
+    });
+
+    container.querySelectorAll('.rec-delete-proto-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        const isSample = btn.dataset.isSample === 'true';
+        const name = btn.dataset.name || 'regenerációs programot';
+        if (isSample) {
+          if (!confirm(`Biztosan elrejted a(z) "${name}" minta regenerációs programot?`)) return;
+          _markSampleDeleted('protocols', id);
+          _renderProtocolsList();
+          return;
+        }
+        if (id) {
+          const uid = _getEffectiveUid();
+          if (!confirm(`Biztosan törlöd a(z) "${name}" regenerációs programot a sablonok közül?`)) return;
+          _allProtocols = _allProtocols.filter(p => p.id !== id && p.name !== id);
+          _saveProtocolsToLocal(uid);
+          _renderProtocolsList();
+          _renderUnifiedProgramsList();
+          if (db && uid && !uid.startsWith('local_')) {
+            deleteDoc(doc(db, 'users', uid, 'recoveryProtocols', id)).catch(err => {
+              console.warn('[activity] Error deleting protocol:', err);
+            });
+          }
+        }
+      });
+    });
+  });
+}
+
+async function _saveProtocol() {
+  const uid = _getEffectiveUid();
+  const nameIn = $('rec-proto-name-in');
+  const typeIn = $('rec-proto-type-in');
+  const durIn = $('rec-proto-dur-in');
+  const exIn = $('rec-proto-exercises-in');
+  const muscleIn = $('rec-proto-muscle-in');
+  const saveBtn = $('rec-save-protocol-btn');
+  const subcatIn = $('rec-proto-subcat-in');
+  const container = $('rec-proto-structured-exercises-container');
+
+  const name = nameIn?.value.trim();
+  if (!name) {
+    alert('Kérlek add meg a regenerációs program nevét!');
+    nameIn?.focus();
+    return;
+  }
+
+  const subcategory = subcatIn?.value.trim() || '';
+  const muscleKey = muscleIn?.value || 'all';
+  const muscleLabel = MUSCLE_KEY_NAMES[muscleKey] || muscleKey;
+
+  const exerciseLines = [];
+  if (container) {
+    container.querySelectorAll('.wo-structured-ex-row').forEach(row => {
+      const exName = row.dataset.name || row.querySelector('.wo-ex-name-display')?.textContent.trim() || 'Gyakorlat';
+      const sets = parseInt(row.querySelector('.wo-ex-sets')?.value, 10) || 1;
+      const reps = parseInt(row.querySelector('.wo-ex-reps')?.value, 10) || 1;
+      const weightVal = row.querySelector('.wo-ex-weight')?.value.trim();
+      const weight = weightVal ? parseFloat(weightVal) : null;
+      exerciseLines.push(`${exName}: ${sets} × ${reps}${weight ? ` (${weight} kg)` : ''}`);
+    });
+  }
+
+  let exercises = exerciseLines.join('\n');
+  if (!exercises && exIn?.value.trim()) {
+    exercises = exIn.value.trim();
+  }
+
+  const protoId = 'proto_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  const type = typeIn?.value || 'smr';
+  const duration = parseInt(durIn?.value, 10) || 20;
+
+  const localProto = {
+    id: protoId,
+    name,
+    type,
+    category: 'recovery',
+    duration,
+    exercises,
+    subcategory,
+    relievedMuscles: [muscleKey],
+    relievedMuscle: muscleKey,
+    relievedMuscleLabel: muscleLabel,
+    date: (typeof window.getWhoopDate === 'function' ? window.getWhoopDate() : null) || window._whoopSelectedDate || _selectedDate || todayString(),
+    createdAt: new Date().toISOString()
+  };
+
+  // 1. Azonnali helyi mentés
+  _allProtocols.unshift(localProto);
+  _saveProtocolsToLocal(uid);
+
+  // 2. Űrlap és modál reset azonnal
+  if (nameIn) nameIn.value = '';
+  if (exIn) exIn.value = '';
+  if (subcatIn) subcatIn.value = '';
+  if (container) container.innerHTML = '';
+  if (saveBtn) {
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Mentés';
+  }
+  _closeProtocolsModal();
+  _renderProtocolsList();
+  _renderUnifiedProgramsList();
+
+  // 3. Háttérben Firestore mentés
+  if (db && uid && !uid.startsWith('local_')) {
+    addDoc(collection(db, 'users', uid, 'recoveryProtocols'), {
+      name,
+      type,
+      category: 'recovery',
+      duration,
+      exercises,
+      subcategory,
+      relievedMuscles: [muscleKey],
+      relievedMuscle: muscleKey,
+      relievedMuscleLabel: muscleLabel,
+      date: localProto.date,
+      createdAt: serverTimestamp()
+    }).then(ref => {
+      const item = _allProtocols.find(x => x.id === protoId);
+      if (item) {
+        item.id = ref.id;
+        _saveProtocolsToLocal(uid);
+      }
+    }).catch(err => {
+      console.warn('[activity] Firestore protocol save error (kept local):', err);
+    });
+  }
+}
+
+function _renderRecoveryExercisesList() {
+  const container = $('rec-exercises-list');
+  if (!container) return;
+
+  const all = [...DEFAULT_EXERCISES, ..._allExercises];
+  const recExercises = all.filter(ex => {
+    const c = (ex.category || '').toLowerCase();
+    const s = (ex.sportId || '').toLowerCase();
+    const n = (ex.name || '').toLowerCase();
+    return /smr|nyújt|stretch|légzés|breath|hideg|meleg|sauna|szauna|mobilit|henger/i.test(c + ' ' + s + ' ' + n);
+  });
+
+  if (recExercises.length === 0) {
+    container.innerHTML = `
+      <div class="text-center py-8 text-gray-400 text-xs italic">
+        Még nincs regenerációs gyakorlat. Kattints az "+ Új gyakorlat" gombra!
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = recExercises.map(ex => {
+    const isCustom = _allExercises.some(ce => ce.id === ex.id);
+    return `
+      <div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-gray-100 dark:border-slate-800 shadow-sm flex items-center justify-between">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="w-8 h-8 rounded-xl bg-violet-50 dark:bg-violet-950/60 text-violet-500 flex items-center justify-center text-xs flex-shrink-0">
+            <i class="fa-solid fa-spa"></i>
+          </div>
+          <div class="min-w-0">
+            <h4 class="text-xs font-bold text-gray-900 dark:text-white truncate">${ex.name}</h4>
+            <p class="text-[10px] text-gray-400 truncate"><span class="text-violet-500 font-semibold">${ex.category || 'SMR / Nyújtás'}</span></p>
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5 flex-shrink-0">
+          <span class="text-[9px] px-2 py-0.5 rounded-full font-bold bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-300">
+            ${ex.category || 'SMR'}
+          </span>
+          ${isCustom ? `
+            <button type="button" class="rec-edit-single-ex-btn w-6 h-6 rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-gray-600 dark:text-gray-300 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" title="Gyakorlat szerkesztése">
+              <i class="fa-solid fa-pen pointer-events-none"></i>
+            </button>
+            <button type="button" class="rec-del-single-ex-btn w-6 h-6 rounded-lg bg-red-50 hover:bg-red-100 dark:bg-red-950/40 dark:hover:bg-red-900/60 text-red-500 flex items-center justify-center text-[10px] active:scale-95 transition-all" data-id="${ex.id}" data-name="${_esc(ex.name)}" title="Gyakorlat törlése">
+              <i class="fa-solid fa-trash pointer-events-none"></i>
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.rec-edit-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const ex = _allExercises.find(x => x.id === id);
+      if (!ex) return;
+      _openExercisesModal();
+      _startEditingExercise(ex);
+    });
+  });
+
+  container.querySelectorAll('.rec-del-single-ex-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      const name = btn.dataset.name || 'gyakorlatot';
+      if (!id || !_uid) return;
+      if (!confirm(`Biztosan törlöd a(z) "${name}" gyakorlatot a könyvtáradból?`)) return;
+      try {
+        await deleteDoc(doc(db, 'users', _uid, 'exercises', id));
+      } catch (err) {
+        console.error('[activity] Error deleting recovery exercise:', err);
+      }
+    });
+  });
+}
+
